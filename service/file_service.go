@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/MoeForge/moego/base64"
 	"github.com/QuantumNous/new-api/common"
@@ -153,10 +155,62 @@ func CleanupFileSources(c *gin.Context) {
 	}
 }
 
+// ErrDownloadBudgetExceeded is returned once the media downloads of a request
+// read more than its download budget.
+var ErrDownloadBudgetExceeded = errors.New("media downloads exceed the size allowed for this request")
+
+const downloadBudgetKey = "media_download_budget"
+
+// downloadBudget is the number of bytes the media downloads of one request may
+// still read.
+type downloadBudget struct {
+	mu        sync.Mutex
+	remaining int64
+}
+
+// SetDownloadBudget bounds the total bytes the media downloads of the request
+// read, on top of the per-file limit.
+func SetDownloadBudget(c *gin.Context, bytes int64) {
+	c.Set(downloadBudgetKey, &downloadBudget{remaining: bytes})
+}
+
+func requestDownloadBudget(c *gin.Context) *downloadBudget {
+	if c == nil {
+		return nil
+	}
+	value, ok := c.Get(downloadBudgetKey)
+	if !ok {
+		return nil
+	}
+	budget, _ := value.(*downloadBudget)
+	return budget
+}
+
+func (b *downloadBudget) left() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.remaining
+}
+
+func (b *downloadBudget) spend(bytes int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.remaining -= bytes
+}
+
 // loadFromURL 从 URL 加载文件
 func loadFromURL(c *gin.Context, url string, reason ...string) (*types.CachedFileData, error) {
 	// 下载文件
 	var maxFileSize = constant.MaxFileDownloadMB * 1024 * 1024
+	readLimit := int64(maxFileSize)
+	budget := requestDownloadBudget(c)
+	if budget != nil {
+		left := budget.left()
+		if left <= 0 {
+			return nil, ErrDownloadBudgetExceeded
+		}
+		readLimit = min(readLimit, left)
+	}
 
 	if common.DebugEnabled {
 		logger.LogDebug(c, "loadFromURL: initiating download")
@@ -175,11 +229,17 @@ func loadFromURL(c *gin.Context, url string, reason ...string) (*types.CachedFil
 	if common.DebugEnabled {
 		logger.LogDebug(c, "loadFromURL: reading response body")
 	}
-	fileBytes, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxFileSize+1)))
+	fileBytes, err := io.ReadAll(io.LimitReader(resp.Body, readLimit+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file content: %w", err)
 	}
-	if len(fileBytes) > maxFileSize {
+	if budget != nil {
+		budget.spend(int64(len(fileBytes)))
+	}
+	if int64(len(fileBytes)) > readLimit {
+		if readLimit < int64(maxFileSize) {
+			return nil, ErrDownloadBudgetExceeded
+		}
 		return nil, fmt.Errorf("file size exceeds maximum allowed size: %dMB", constant.MaxFileDownloadMB)
 	}
 

@@ -22,6 +22,8 @@ type usageSummary struct {
 	CachedTokens     int            `json:"cached_tokens"`
 	AudioTokens      int            `json:"audio_tokens"`
 	ReasoningTokens  int            `json:"reasoning_tokens"`
+	GroundingQueries int            `json:"grounding_queries,omitempty"`
+	Unexpected       int            `json:"unexpected,omitempty"`
 	Quota            int            `json:"quota"`
 	PreConsumed      int            `json:"pre_consumed"`
 	BatchRatio       float64        `json:"batch_ratio"`
@@ -99,7 +101,9 @@ func resultLine(customId string, result *UpstreamResult) outputLine {
 // buildSettlement prices every result of a finished batch and writes its
 // output and error files. lines is the input in order, or nil when the input
 // file is gone; then a succeeded result without usage is charged the average
-// reservation.
+// reservation. A result the input does not list is a fault of the upstream
+// and is not charged; without the input, at most as many results as the
+// batch has requests are charged.
 func buildSettlement(b *model.Batch, snapshot *billingSnapshot, lines []*inputLine, upstream *UpstreamBatch) *settlementResult {
 	c := &gin.Context{}
 	info := snapshot.relayInfo()
@@ -144,6 +148,7 @@ func buildSettlement(b *model.Batch, snapshot *billingSnapshot, lines []*inputLi
 			return
 		}
 		summary.Succeeded++
+		summary.GroundingQueries += result.GroundingQueries
 		charge := chargeResult(c, info, input, result, estimate)
 		summary.Quota += charge.Quota
 		if charge.Estimated {
@@ -180,11 +185,18 @@ func buildSettlement(b *model.Batch, snapshot *billingSnapshot, lines []*inputLi
 		delete(results, line.CustomId)
 		account(line.CustomId, line, result, estimates[index])
 	}
-	// Results the input does not list still cost what the upstream billed.
+	charged := 0
 	for _, customId := range order {
-		if result, ok := results[customId]; ok {
-			account(customId, nil, result, fallbackEstimate)
+		result, ok := results[customId]
+		if !ok {
+			continue
 		}
+		if lines != nil || charged >= b.RequestTotal {
+			summary.Unexpected++
+			continue
+		}
+		charged++
+		account(customId, nil, result, fallbackEstimate)
 	}
 
 	switch {

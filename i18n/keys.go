@@ -146,4 +146,8 @@ const (
 	MsgBatchCancelNotSupported      = "batch.cancel_not_supported"
 	MsgBatchNotDeletable            = "batch.not_deletable"
 	MsgBatchInternalError           = "batch.internal_error"
+	MsgBatchTooManyFiles            = "batch.too_many_files"
+	MsgBatchTooManyRemoteMedia      = "batch.too_many_remote_media"
+	MsgBatchNotHeld                 = "batch.not_held"
+	MsgBatchInvalidResolution       = "batch.invalid_resolution"
 )

@@ -99,7 +99,14 @@ func (a *openRouterAdaptor) Submit(ctx context.Context, conn *Connection, req *S
 	if err != nil {
 		return nil, err
 	}
-	return parseOpenRouterBatch(data)
+	batch, err := parseOpenRouterBatch(data)
+	if err != nil {
+		return nil, err
+	}
+	if batch.Id == "" {
+		return nil, ErrNoUpstreamId
+	}
+	return batch, nil
 }
 
 func (a *openRouterAdaptor) Retrieve(ctx context.Context, conn *Connection, upstreamId string) (*UpstreamBatch, error) {
@@ -126,7 +133,7 @@ func parseOpenRouterBatch(data []byte) (*UpstreamBatch, error) {
 	}
 	batch := &UpstreamBatch{
 		Id:        parsed.Id,
-		Status:    parsed.Status,
+		Status:    openAIStatus(parsed.Status),
 		Total:     parsed.RequestCounts.Total,
 		Completed: parsed.RequestCounts.Completed,
 		Failed:    parsed.RequestCounts.Failed,
@@ -134,7 +141,7 @@ func parseOpenRouterBatch(data []byte) (*UpstreamBatch, error) {
 		ResolvedModel: parsed.Model,
 	}
 	if parsed.ExpiresAt != nil {
-		batch.ExpiresAt = *parsed.ExpiresAt
+		batch.ExpiresAt = unixSeconds(*parsed.ExpiresAt)
 	}
 	if parsed.Usage != nil {
 		batch.Cost = parsed.Usage.Cost
@@ -168,8 +175,17 @@ func convertOpenRouterResult(item openRouterResult) UpstreamResult {
 		result.RequestId = item.Response.RequestId
 		result.Body = item.Response.Body
 		var body struct {
-			Model string     `json:"model"`
-			Usage *dto.Usage `json:"usage"`
+			Model   string     `json:"model"`
+			Usage   *dto.Usage `json:"usage"`
+			Choices []struct {
+				Message struct {
+					ToolCalls []struct {
+						Function struct {
+							Name string `json:"name"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"message"`
+			} `json:"choices"`
 		}
 		if len(item.Response.Body) > 0 && common.Unmarshal(item.Response.Body, &body) == nil {
 			result.Model = body.Model
@@ -177,10 +193,15 @@ func convertOpenRouterResult(item openRouterResult) UpstreamResult {
 			if body.Usage != nil {
 				result.Cost = usageCost(body.Usage.Cost)
 			}
+			for _, choice := range body.Choices {
+				for _, call := range choice.Message.ToolCalls {
+					result.FunctionCalls = append(result.FunctionCalls, call.Function.Name)
+				}
+			}
 		}
 	}
 	if item.Error != nil {
-		result.ErrorMessage = item.Error.Message
+		result.ErrorMessage = cleanMessage(item.Error.Message)
 		if item.Error.Code != nil {
 			result.ErrorCode = common.Interface2String(item.Error.Code)
 		}
@@ -201,4 +222,24 @@ func usageCost(cost any) *float64 {
 		}
 	}
 	return nil
+}
+
+// openAIStatus keeps the statuses of the OpenAI Batch object; any other maps
+// to "", which keeps the batch's current status.
+func openAIStatus(status string) string {
+	switch status {
+	case model.BatchStatusValidating, model.BatchStatusInProgress, model.BatchStatusFinalizing,
+		model.BatchStatusCancelling, model.BatchStatusCompleted, model.BatchStatusFailed,
+		model.BatchStatusExpired, model.BatchStatusCancelled:
+		return status
+	}
+	return ""
+}
+
+// unixSeconds reads a timestamp given in seconds or milliseconds.
+func unixSeconds(value int64) int64 {
+	if value > 1e11 {
+		return value / 1000
+	}
+	return value
 }

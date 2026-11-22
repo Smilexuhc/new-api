@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -91,7 +92,7 @@ func openSQLiteTestDB() {
 		&model.User{}, &model.Token{}, &model.Log{}, &model.Channel{}, &model.Ability{},
 		&model.SystemTask{}, &model.SystemTaskLock{},
 		&model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}, &model.SubscriptionPlan{},
-		&model.Batch{}, &model.BatchFile{},
+		&model.Batch{}, &model.BatchFile{}, &model.BatchFilePart{},
 	); err != nil {
 		panic(err)
 	}
@@ -171,7 +172,7 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 func resetDB(t *testing.T) {
 	t.Helper()
 	for _, table := range []string{"users", "tokens", "logs", "channels", "abilities", "user_subscriptions",
-		"subscription_pre_consume_records", "batches", "batch_files", "system_tasks"} {
+		"subscription_pre_consume_records", "batches", "batch_files", "batch_file_parts", "system_tasks"} {
 		require.NoError(t, model.DB.Exec("DELETE FROM "+table).Error)
 	}
 	setting := operation_setting.GetBatchSetting()
@@ -182,6 +183,7 @@ func resetDB(t *testing.T) {
 		DefaultMaxOutputTokens: 100,
 		PollIntervalSeconds:    60,
 		FileRetentionDays:      30,
+		MaxInputFilesPerUser:   100,
 	}
 	seedUser(t, testUser, testToken, testTokenKey)
 	seedUser(t, otherUser, otherToken, otherTokenKey)
@@ -673,10 +675,10 @@ func TestBatchSettlementUsesTheSubscriptionThatPaid(t *testing.T) {
 		BillingSource: "subscription", SubscriptionId: 7, Model: testModel}
 	require.NoError(t, model.CreateBatch(b))
 
-	won, err := model.SettleBatch(b.BatchId, map[string]any{"status": model.BatchStatusCompleted, "quota": 200}, nil)
+	charge := batchSettlement(b, 200)
+	won, _, err := model.SettleBatch(b.BatchId, model.BatchBillingReserved, map[string]any{"status": model.BatchStatusCompleted, "quota": 200}, nil, service.BatchFunding(charge))
 	require.NoError(t, err)
 	require.True(t, won)
-	settle(t.Context(), b, 200, 0, 0, nil, nil)
 	var reloaded model.UserSubscription
 	require.NoError(t, model.DB.First(&reloaded, 7).Error)
 	assert.Equal(t, int64(1000-300), reloaded.AmountUsed)
@@ -936,7 +938,7 @@ func TestBatchDeleteNeedsASettledBatch(t *testing.T) {
 	assert.Nil(t, DeleteFile(testUser, file.FileId))
 }
 
-func TestBatchStateSurvivesRestartAndLostSubmissionIsRefunded(t *testing.T) {
+func TestBatchStateSurvivesRestartAndLostSubmissionIsHeld(t *testing.T) {
 	resetDB(t)
 	upstream := newFakeUpstream(t)
 	seedBatchChannel(t, 1, constant.ChannelTypeOpenRouter, upstream.server.URL)
@@ -951,16 +953,40 @@ func TestBatchStateSurvivesRestartAndLostSubmissionIsRefunded(t *testing.T) {
 	upstream.set(openRouterTerminal("completed", "["+orResult("a", 2, 2, "m", 0)+"]", "0"))
 	assert.Equal(t, model.BatchStatusCompleted, poll(t, b.BatchId).Status)
 
-	// A crash between saving the record and submitting leaves no upstream id;
-	// after the grace period the reservation is refunded.
+	// A crash between saving the record and submitting leaves no upstream id.
+	// The submission may have reached the upstream, so after the grace period
+	// the reservation is held for an administrator.
 	lost := &model.Batch{BatchId: "batch_lost", UserId: testUser, TokenId: testToken, ChannelId: 1, ChannelType: constant.ChannelTypeOpenRouter,
 		Status: model.BatchStatusValidating, Quota: 400, BillingState: model.BatchBillingReserved, BillingSource: "wallet",
-		CreatedAt: time.Now().Add(-time.Hour).Unix(), Model: testModel}
+		CreatedAt: time.Now().Add(-time.Hour).Unix(), Model: testModel, SubmissionUnrecorded: true}
 	require.NoError(t, model.CreateBatch(lost))
 	before := userQuota(t, testUser)
 	refreshed := poll(t, lost.BatchId)
-	assert.Equal(t, model.BatchStatusFailed, refreshed.Status)
+	assert.Equal(t, model.BatchBillingHeld, refreshed.BillingState)
+	assert.Contains(t, refreshed.Errors, "submission_unconfirmed")
+	assert.Equal(t, before, userQuota(t, testUser), "a held batch keeps its reservation")
+
+	resolved := resolve(t, lost.BatchId, ResolveActionRefund, nil)
+	assert.Equal(t, model.BatchStatusFailed, resolved.Status)
 	assert.Equal(t, before+400, userQuota(t, testUser))
+	assert.Equal(t, http.StatusConflict, resolveErr(t, lost.BatchId, ResolveActionRefund).Status, "a resolved batch is not resolved twice")
+	assert.Equal(t, before+400, userQuota(t, testUser))
+}
+
+func resolve(t *testing.T, batchId string, action string, quota *int) *model.Batch {
+	t.Helper()
+	_, apiErr := ResolveHeldBatch(t.Context(), 1, batchId, &ResolveRequest{Action: action, Quota: quota})
+	require.Nil(t, apiErr)
+	var b model.Batch
+	require.NoError(t, model.DB.Where("batch_id = ?", batchId).First(&b).Error)
+	return &b
+}
+
+func resolveErr(t *testing.T, batchId string, action string) *Error {
+	t.Helper()
+	_, apiErr := ResolveHeldBatch(t.Context(), 1, batchId, &ResolveRequest{Action: action})
+	require.NotNil(t, apiErr)
+	return apiErr
 }
 
 func TestBatchUpstreamNotFoundKeepsReservation(t *testing.T) {
@@ -973,16 +999,29 @@ func TestBatchUpstreamNotFoundKeepsReservation(t *testing.T) {
 	upstream.mu.Lock()
 	upstream.retrieveCode = http.StatusNotFound
 	upstream.mu.Unlock()
-	for attempt := 1; attempt < notFoundPollsBeforeGiveUp; attempt++ {
+	for attempt := 1; attempt < notFoundPollsBeforeHold; attempt++ {
 		waiting := poll(t, b.BatchId)
 		require.Equal(t, model.BatchBillingReserved, waiting.BillingState, "a single not found does not end the batch")
 		assert.Equal(t, attempt, waiting.PollFailures)
 	}
-	failed := poll(t, b.BatchId)
-	assert.Equal(t, model.BatchStatusFailed, failed.Status)
-	assert.Equal(t, model.BatchBillingSettled, failed.BillingState)
-	assert.Equal(t, b.Quota, failed.Quota)
+	held := poll(t, b.BatchId)
+	assert.Equal(t, model.BatchBillingHeld, held.BillingState)
+	assert.Contains(t, held.Errors, "upstream_unavailable")
 	assert.Equal(t, startQuota-b.Quota, userQuota(t, testUser), "the upstream may have billed it")
+	PollOnce(t.Context())
+	assert.Equal(t, held.PollFailures, poll(t, b.BatchId).PollFailures, "a held batch is not polled")
+
+	// After the upstream comes back, resume settles from its results.
+	upstream.mu.Lock()
+	upstream.retrieveCode = 0
+	upstream.mu.Unlock()
+	upstream.set(openRouterTerminal("completed", "["+orResult("a", 2, 2, "m", 0)+"]", "0"))
+	resumed := resolve(t, b.BatchId, ResolveActionResume, nil)
+	assert.Equal(t, model.BatchBillingReserved, resumed.BillingState)
+	settled := poll(t, b.BatchId)
+	assert.Equal(t, model.BatchStatusCompleted, settled.Status)
+	assert.Equal(t, model.BatchBillingSettled, settled.BillingState)
+	assert.Equal(t, startQuota-settled.Quota, userQuota(t, testUser))
 }
 
 func TestBatchPollBacksOffOnUpstreamErrors(t *testing.T) {

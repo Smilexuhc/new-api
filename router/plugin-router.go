@@ -63,11 +63,19 @@ var defaultPluginDispatcher = &pluginRouteDispatcher{registry: jsplugin.DefaultR
 // pluginHandoffRoutes are the host routes that offer matching requests to the
 // plugin routes before their own handlers run, so a plugin route may overlap
 // them: GET /v1/videos/:task_id offers a task to its own plugin's query route
-// (handOffNativeTaskQuery) and the Gemini relay offers :predictLongRunning.
-var pluginHandoffRoutes = map[string]struct{}{
-	http.MethodGet + " /v1/videos/:task_id":   {},
-	http.MethodPost + " /v1beta/models/*path": {},
-}
+// (handOffNativeTaskQuery), the Gemini relay offers :predictLongRunning and
+// the batch routes offer every request while the batch API is disabled.
+var pluginHandoffRoutes = func() map[string]struct{} {
+	routes := map[string]struct{}{
+		http.MethodGet + " /v1/videos/:task_id":   {},
+		http.MethodPost + " /v1beta/models/*path": {},
+	}
+	for _, route := range batchRoutes {
+		routes[route.method+" /v1/batches"+route.path] = struct{}{}
+		routes[route.method+" /v1/batches"+route.path+"/"] = struct{}{}
+	}
+	return routes
+}()
 
 func SetPluginRouter(outer *gin.Engine) gin.HandlerFunc {
 	trustedProxies, _, err := common.ResolveTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
@@ -323,6 +331,9 @@ func (b *pluginGenerationBuilder) routeAnsweredByHost(route jsplugin.Route) bool
 			continue
 		}
 		_, offersToPlugins := pluginHandoffRoutes[staticRoute.Method+" "+staticRoute.Path]
+		if offersToPlugins && handoffWithoutRedirect(staticRoute.Method, staticRoute.Path) {
+			continue
+		}
 		if routeIntersectsStaticRoute(route, staticRoute.Path, offersToPlugins) {
 			return true
 		}
@@ -670,6 +681,17 @@ func routeSegmentsIntersect(left, right []routePatternSegment) bool {
 // redirect it causes. A query route's task-id parameter meets only the static
 // route's wildcards. A static route that offers matching requests to the
 // plugin routes first does not answer them itself, but its redirect still does.
+// handoffWithoutRedirect reports whether the trailing-slash form of a handoff
+// route is a handoff route too, so neither form redirects.
+func handoffWithoutRedirect(method string, path string) bool {
+	alternate := strings.TrimSuffix(path, "/")
+	if alternate == path {
+		alternate += "/"
+	}
+	_, ok := pluginHandoffRoutes[method+" "+alternate]
+	return ok
+}
+
 func routeIntersectsStaticRoute(route jsplugin.Route, staticPath string, offersToPlugins bool) bool {
 	pluginSegments := parseRoutePattern(route.Path)
 	if route.Type == jsplugin.RouteTypeQuery {

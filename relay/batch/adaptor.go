@@ -16,6 +16,10 @@ import (
 
 var ErrCancelNotSupported = errors.New("the upstream batch API has no cancel operation")
 
+// ErrNoUpstreamId is returned when the upstream accepted a submission without
+// naming the batch; it may run upstream and cannot be tracked.
+var ErrNoUpstreamId = errors.New("the upstream accepted the batch without returning its id")
+
 // Connection addresses one upstream account: a channel and one of its keys.
 type Connection struct {
 	ChannelType int
@@ -75,9 +79,14 @@ type UpstreamResult struct {
 	Usage *dto.Usage
 	Model string
 	// Cost is the upstream charge in USD for this request when reported.
-	Cost         *float64
-	ErrorCode    string
-	ErrorMessage string
+	Cost *float64
+	// GroundingQueries is the number of distinct search queries a grounded
+	// response ran; FunctionCalls names the function calls it made. Both are
+	// priced by the tool price table like a synchronous response.
+	GroundingQueries int
+	FunctionCalls    []string
+	ErrorCode        string
+	ErrorMessage     string
 }
 
 func (r *UpstreamResult) Succeeded() bool {

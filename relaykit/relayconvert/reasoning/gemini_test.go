@@ -138,6 +138,19 @@ func TestRenderGeminiMapsAndClampsInsteadOfRejecting(t *testing.T) {
 			wantCodes:  []string{"gemini_thinking_disable_unsupported"},
 		},
 		{
+			name:       "minimal on gemini 3.8 flash lite is kept",
+			model:      "gemini-3.8-flash-lite",
+			intent:     Intent{Mode: ModeEnabled, Effort: EffortMinimal},
+			wantLevel:  "minimal",
+			wantEffort: EffortMinimal,
+		},
+		{
+			name:    "unset on gemini 3.8 flash lite sends no level",
+			model:   "gemini-3.8-flash-lite",
+			intent:  Intent{},
+			wantNil: true,
+		},
+		{
 			name:       "effort on gemini 2.5 flash becomes budget",
 			model:      "gemini-2.5-flash",
 			intent:     Intent{Mode: ModeEnabled, Effort: EffortHigh},

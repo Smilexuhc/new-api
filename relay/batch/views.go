@@ -158,7 +158,7 @@ func NewBatchObject(b *model.Batch) BatchObject {
 }
 
 func batchErrorsJSON(code string, message string) string {
-	data, _ := common.Marshal(BatchErrors{Object: "list", Data: []BatchErrorData{{Code: code, Message: message}}})
+	data, _ := common.Marshal(BatchErrors{Object: "list", Data: []BatchErrorData{{Code: code, Message: cleanMessage(message)}}})
 	return string(data)
 }
 

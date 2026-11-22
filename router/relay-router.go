@@ -1,6 +1,7 @@
 package router
 
 import (
+	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -8,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
 )
@@ -187,19 +189,23 @@ func SetRelayRouter(router *gin.Engine) {
 	}
 
 	// Batches are forwarded to upstream native batch APIs. The gate runs
-	// before authentication so a disabled API answers like an unknown route.
+	// before authentication so a disabled API answers like an unknown route:
+	// a plugin route at the same path serves the request, or it is not found.
 	batchRouter := router.Group("/v1/batches")
+	batchRouter.Use(func(c *gin.Context) {
+		if !operation_setting.GetBatchSetting().Enabled {
+			defaultPluginDispatcher.dispatch(c)
+		}
+	})
 	batchRouter.Use(controller.BatchGate())
 	batchRouter.Use(middleware.RouteTag("relay"))
 	batchRouter.Use(middleware.SystemPerformanceCheck())
 	batchRouter.Use(middleware.TokenAuth())
-	{
-		// Only creating a batch counts as a model request; polling does not.
-		batchRouter.POST("", middleware.ModelRequestRateLimit(), controller.CreateBatch)
-		batchRouter.GET("", controller.ListBatches)
-		batchRouter.GET("/:id", controller.RetrieveBatch)
-		batchRouter.POST("/:id/cancel", controller.CancelBatch)
-		batchRouter.DELETE("/:id", controller.DeleteBatch)
+	// Each route is also registered with a trailing slash, which would
+	// otherwise answer with a redirect even while the API is disabled.
+	for _, route := range batchRoutes {
+		batchRouter.Handle(route.method, route.path, route.handlers...)
+		batchRouter.Handle(route.method, route.path+"/", route.handlers...)
 	}
 
 	relayMjRouter := router.Group("/mj")
@@ -265,4 +271,20 @@ func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {
 		relayMjRouter.POST("/insight-face/swap", controller.RelayMidjourney)
 		relayMjRouter.POST("/submit/upload-discord-images", controller.RelayMidjourney)
 	}
+}
+
+type batchRoute struct {
+	method   string
+	path     string
+	handlers []gin.HandlerFunc
+}
+
+// batchRoutes are the /v1/batches routes. Only creating a batch counts as a
+// model request; polling does not.
+var batchRoutes = []batchRoute{
+	{http.MethodPost, "", []gin.HandlerFunc{middleware.ModelRequestRateLimit(), controller.CreateBatch}},
+	{http.MethodGet, "", []gin.HandlerFunc{controller.ListBatches}},
+	{http.MethodGet, "/:id", []gin.HandlerFunc{controller.RetrieveBatch}},
+	{http.MethodPost, "/:id/cancel", []gin.HandlerFunc{controller.CancelBatch}},
+	{http.MethodDelete, "/:id", []gin.HandlerFunc{controller.DeleteBatch}},
 }

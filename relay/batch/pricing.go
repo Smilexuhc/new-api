@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -55,6 +56,9 @@ const (
 	remoteVideoTokens    = 600 * 300
 	remoteAudioTokens    = 600 * 32
 	remoteDocumentTokens = 20 * 1500
+	// A link that is about to be downloaded and priced from its bytes counts
+	// as one small image until then.
+	prefetchLinkTokens = imageBaseTokens
 )
 
 // billingSnapshot freezes the price of a batch when it is created, so a price
@@ -92,12 +96,32 @@ func (s *billingSnapshot) relayInfo() *relaycommon.RelayInfo {
 	return info
 }
 
+// groundingReserveQueries is the number of search queries reserved for a
+// request that may ground on Google Search; settlement charges the queries it
+// ran.
+const groundingReserveQueries = 10
+
+// toolUsage is what one request ran that the tool price table bills.
+type toolUsage struct {
+	GroundingQueries int
+	FunctionCalls    []string
+}
+
 // priceItem prices one request of the batch. An expression reads request
 // parameters from the request's own body, not from the batch create call.
-func priceItem(c *gin.Context, info *relaycommon.RelayInfo, line *inputLine, usage *dto.Usage) (service.TextUsagePrice, error) {
+// Tool calls are priced like the synchronous relay prices them.
+func priceItem(c *gin.Context, info *relaycommon.RelayInfo, line *inputLine, usage *dto.Usage, tools toolUsage) (service.TextUsagePrice, error) {
 	info.BillingRequestInput = nil
 	if info.TieredBillingSnapshot != nil && line != nil {
 		info.BillingRequestInput = &billingexpr.RequestInput{Body: line.RawBody}
+	}
+	info.ResponsesUsageInfo = nil
+	if tools.GroundingQueries > 0 {
+		info.SetBillableToolCount(dto.BuildInToolGoogleSearch, tools.GroundingQueries)
+		info.SetBillableToolCount(relaycommon.GoogleSearchGroundedPromptTool, 1)
+	}
+	for _, name := range tools.FunctionCalls {
+		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
 	}
 	return service.PriceTextUsage(c, info, usage)
 }
@@ -106,7 +130,14 @@ func priceItem(c *gin.Context, info *relaycommon.RelayInfo, line *inputLine, usa
 // estimated from body, which is the request in OpenAI chat or Gemini format,
 // and maxOutput, the output limit sent upstream.
 func estimateUsage(body []byte, maxOutput int) *dto.Usage {
-	var estimate mediaEstimate
+	return estimateUsageOf(body, maxOutput, false)
+}
+
+// estimateUsageOf is estimateUsage; with prefetch, image and video links are
+// counted at prefetchLinkTokens because the request is priced again once
+// they are downloaded.
+func estimateUsageOf(body []byte, maxOutput int, prefetch bool) *dto.Usage {
+	estimate := mediaEstimate{prefetch: prefetch}
 	var root any
 	if err := common.Unmarshal(body, &root); err == nil {
 		estimate.walk(root)
@@ -129,6 +160,19 @@ type mediaEstimate struct {
 	payloadBytes int
 	audioTokens  int
 	visualTokens int
+	remoteItems  int
+	prefetch     bool
+}
+
+// remoteMediaCount is the number of media a request links to rather than
+// carries.
+func remoteMediaCount(body []byte) int {
+	var estimate mediaEstimate
+	var root any
+	if err := common.Unmarshal(body, &root); err == nil {
+		estimate.walk(root)
+	}
+	return estimate.remoteItems
 }
 
 func (e *mediaEstimate) walk(value any) {
@@ -158,7 +202,10 @@ func (e *mediaEstimate) field(key string, value any) bool {
 		if url == "" || strings.HasPrefix(url, "data:") {
 			return false
 		}
-		if key == "image_url" {
+		e.remoteItems++
+		if e.prefetch {
+			e.visualTokens += prefetchLinkTokens
+		} else if key == "image_url" {
 			e.visualTokens += remoteImageTokens
 		} else {
 			e.visualTokens += remoteVideoTokens
@@ -183,6 +230,7 @@ func (e *mediaEstimate) field(key string, value any) bool {
 		if strings.HasPrefix(data, "data:") || (data == "" && id == "") {
 			return false
 		}
+		e.remoteItems++
 		e.visualTokens += remoteDocumentTokens
 		return true
 	case "inlineData", "inline_data":
@@ -227,7 +275,7 @@ func (e *mediaEstimate) inline(mimeType string, base64Data string) {
 			e.audioTokens += decoded/compressedAudioBytesPerToken + 1
 		}
 	case strings.HasPrefix(mimeType, "video/"):
-		e.visualTokens += decoded/videoBytesPerToken + 1
+		e.visualTokens += videoTokens(base64Data)
 	case strings.HasPrefix(mimeType, "image/"):
 		e.visualTokens += imageBaseTokens + decoded/imageBytesPerToken
 	default:
@@ -236,6 +284,7 @@ func (e *mediaEstimate) inline(mimeType string, base64Data string) {
 }
 
 func (e *mediaEstimate) remote(mimeType string) {
+	e.remoteItems++
 	mimeType = strings.ToLower(mimeType)
 	switch {
 	case strings.HasPrefix(mimeType, "audio/"):
@@ -291,6 +340,11 @@ type itemCharge struct {
 // from its uploaded body. Each charge saturates at the single-request bound,
 // so the int64 total cannot wrap; the clamp, if any, belongs in the submit log.
 func estimateCharges(c *gin.Context, snapshot *billingSnapshot, lines []*inputLine, bodies [][]byte) ([]int, int, *common.QuotaClamp, error) {
+	return estimateChargesOf(c, snapshot, lines, bodies, false)
+}
+
+// estimateChargesOf is estimateCharges; prefetch is passed to estimateUsageOf.
+func estimateChargesOf(c *gin.Context, snapshot *billingSnapshot, lines []*inputLine, bodies [][]byte, prefetch bool) ([]int, int, *common.QuotaClamp, error) {
 	info := snapshot.relayInfo()
 	charges := make([]int, len(lines))
 	total := 0
@@ -299,8 +353,12 @@ func estimateCharges(c *gin.Context, snapshot *billingSnapshot, lines []*inputLi
 		if index < len(bodies) {
 			body = bodies[index]
 		}
-		usage := estimateUsage(body, line.outputLimit(snapshot.DefaultMaxOutputTokens))
-		price, err := priceItem(c, info, line, usage)
+		usage := estimateUsageOf(body, line.maxOutput(snapshot.DefaultMaxOutputTokens), prefetch)
+		var tools toolUsage
+		if snapshot.ChannelType == constant.ChannelTypeGemini && line.searchesWeb() {
+			tools.GroundingQueries = groundingReserveQueries
+		}
+		price, err := priceItem(c, info, line, usage, tools)
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("request %s: %w", line.CustomId, err)
 		}
@@ -333,19 +391,27 @@ func noteQuotaSaturation(ctx context.Context, b *model.Batch, clamp *common.Quot
 
 // chargeResult prices one result. Failed requests are free. A succeeded
 // request is charged its estimate when the upstream billed it without saying
-// how much, or when its usage cannot be priced. line is nil for a result the
-// input does not list.
+// how much, reported no or negative tokens, or when its usage cannot be
+// priced. line is nil for a result the input does not list.
 func chargeResult(c *gin.Context, info *relaycommon.RelayInfo, line *inputLine, result *UpstreamResult, estimate int) itemCharge {
 	if result == nil || !result.Succeeded() {
 		return itemCharge{}
 	}
-	if result.Usage == nil {
+	if !usable(result.Usage) {
 		return itemCharge{Quota: estimate, Estimated: true}
 	}
-	price, err := priceItem(c, info, line, result.Usage)
+	price, err := priceItem(c, info, line, result.Usage, toolUsage{GroundingQueries: result.GroundingQueries, FunctionCalls: result.FunctionCalls})
 	if err != nil {
 		common.SysError(common.LogText("batch result %s: pricing failed, charging its estimate: %s", result.CustomId, err.Error()))
 		return itemCharge{Quota: estimate, Estimated: true}
 	}
 	return itemCharge{Quota: price.Quota, PromptTokens: price.PromptTokens, CompletionTokens: price.CompletionTokens}
+}
+
+// usable reports whether a usage reports tokens and none negative.
+func usable(usage *dto.Usage) bool {
+	if usage == nil || usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+		return false
+	}
+	return usage.PromptTokens+usage.CompletionTokens > 0
 }

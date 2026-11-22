@@ -16,6 +16,10 @@ import (
 // results of a full batch fit well below it.
 const maxUpstreamResponseBytes = 512 << 20
 
+// maxMessageLength bounds an upstream message kept in a batch or shown to the
+// user.
+const maxMessageLength = 1000
+
 func doUpstream(ctx context.Context, conn *Connection, method string, url string, headers map[string]string, body []byte) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
@@ -48,13 +52,13 @@ func doUpstream(ctx context.Context, conn *Connection, method string, url string
 		return nil, fmt.Errorf("upstream response exceeds %d bytes", maxUpstreamResponseBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &UpstreamError{StatusCode: resp.StatusCode, Message: upstreamErrorMessage(data)}
+		return nil, &UpstreamError{StatusCode: resp.StatusCode, Message: cleanMessage(upstreamErrorMessage(data), conn.BaseURL)}
 	}
 	return data, nil
 }
 
 // upstreamErrorMessage extracts error.message from an error body, falling
-// back to a bounded prefix of the raw body.
+// back to the raw body.
 func upstreamErrorMessage(data []byte) string {
 	var parsed struct {
 		Error struct {
@@ -70,9 +74,15 @@ func upstreamErrorMessage(data []byte) string {
 			return parsed.Message
 		}
 	}
-	text := strings.TrimSpace(string(data))
-	if len(text) > 300 {
-		text = text[:300]
+	return string(data)
+}
+
+// cleanMessage masks addresses and keys in an upstream message, as the
+// synchronous relay does, and bounds its length.
+func cleanMessage(message string, upstreamURLs ...string) string {
+	message = common.MaskSensitiveInfo(strings.TrimSpace(message), upstreamURLs...)
+	if len(message) > maxMessageLength {
+		message = strings.ToValidUTF8(message[:maxMessageLength], "") + "..."
 	}
-	return text
+	return message
 }

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"errors"
 
 	"gorm.io/gorm"
@@ -18,8 +19,13 @@ const (
 	BatchStatusCancelled  = "cancelled"
 )
 
+// A batch holds its reservation while reserved and moves money exactly once
+// when it leaves that state: to settled, or, when its upstream outcome cannot
+// be read, to held, where the reservation stays until an administrator
+// resolves it.
 const (
 	BatchBillingReserved = "reserved"
+	BatchBillingHeld     = "held"
 	BatchBillingSettled  = "settled"
 )
 
@@ -28,12 +34,20 @@ const (
 	BatchFilePurposeOutput = "batch_output"
 )
 
+// batchFilePartSize bounds the content written in one statement, well below
+// the smallest MySQL max_allowed_packet default (4 MiB on 5.7).
+const batchFilePartSize = 1 << 20
+
 var unfinishedBatchStatuses = []string{
 	BatchStatusValidating,
 	BatchStatusInProgress,
 	BatchStatusFinalizing,
 	BatchStatusCancelling,
 }
+
+// unsettledBillingStates are the states whose settlement still reads the
+// input file.
+var unsettledBillingStates = []string{BatchBillingReserved, BatchBillingHeld}
 
 var ErrBatchFileInUse = errors.New("batch file is the input of an unfinished batch")
 
@@ -46,7 +60,8 @@ func IsBatchTerminalStatus(status string) bool {
 }
 
 // BatchFile stores an uploaded batch input or a generated output/error file.
-// Content lives in the database so every node can serve it.
+// Content lives in the database so every node can serve it; content larger
+// than one part is kept in BatchFilePart rows and Content stays empty.
 type BatchFile struct {
 	Id        int    `json:"-" gorm:"primaryKey"`
 	FileId    string `json:"id" gorm:"type:varchar(64);uniqueIndex"`
@@ -58,8 +73,17 @@ type BatchFile struct {
 	LineCount int    `json:"-"`
 	BatchId   string `json:"-" gorm:"type:varchar(64);index"`
 	Content   []byte `json:"-" gorm:"not null"`
+	Parts     int    `json:"-"`
 	CreatedAt int64  `json:"created_at" gorm:"bigint"`
 	ExpiresAt int64  `json:"expires_at" gorm:"bigint;index"`
+}
+
+// BatchFilePart is one piece of the content of a large batch file.
+type BatchFilePart struct {
+	Id      int    `gorm:"primaryKey"`
+	FileId  string `gorm:"type:varchar(64);index:idx_batch_file_part,priority:1"`
+	Seq     int    `gorm:"index:idx_batch_file_part,priority:2"`
+	Content []byte `gorm:"not null"`
 }
 
 // Batch is one batch submitted to an upstream native batch API. The upstream
@@ -103,8 +127,12 @@ type Batch struct {
 	ExpiresAt    int64 `gorm:"bigint"`
 	UpdatedAt    int64 `gorm:"bigint"`
 
-	NextPollAt   int64 `gorm:"bigint;index"`
-	PollFailures int
+	NextPollAt    int64 `gorm:"bigint;index"`
+	PollFailures  int
+	NotFoundPolls int
+	// SubmissionUnrecorded is set until the submission is in the usage
+	// statistics; a batch that never reached the upstream stays uncounted.
+	SubmissionUnrecorded bool
 
 	Quota          int
 	BillingState   string `gorm:"type:varchar(16);index"`
@@ -115,7 +143,59 @@ type Batch struct {
 }
 
 func CreateBatchFile(file *BatchFile) error {
-	return DB.Create(file).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		return createBatchFile(tx, file)
+	})
+}
+
+// createBatchFile writes a file, splitting content larger than one part.
+func createBatchFile(tx *gorm.DB, file *BatchFile) error {
+	content := file.Content
+	if len(content) <= batchFilePartSize {
+		file.Parts = 0
+		return tx.Create(file).Error
+	}
+	file.Content = []byte{}
+	file.Parts = (len(content) + batchFilePartSize - 1) / batchFilePartSize
+	defer func() { file.Content = content }()
+	if err := tx.Create(file).Error; err != nil {
+		return err
+	}
+	for seq := 0; seq < file.Parts; seq++ {
+		end := min((seq+1)*batchFilePartSize, len(content))
+		part := &BatchFilePart{FileId: file.FileId, Seq: seq, Content: content[seq*batchFilePartSize : end]}
+		if err := tx.Create(part).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadBatchFileParts(file *BatchFile) error {
+	if file.Parts == 0 {
+		return nil
+	}
+	var parts []*BatchFilePart
+	if err := DB.Where("file_id = ?", file.FileId).Order("seq asc").Find(&parts).Error; err != nil {
+		return err
+	}
+	if len(parts) != file.Parts {
+		return errors.New("batch file content is incomplete")
+	}
+	var content bytes.Buffer
+	content.Grow(int(file.Bytes))
+	for _, part := range parts {
+		content.Write(part.Content)
+	}
+	file.Content = content.Bytes()
+	return nil
+}
+
+func deleteBatchFileParts(tx *gorm.DB, fileIds []string) error {
+	if len(fileIds) == 0 {
+		return nil
+	}
+	return tx.Where("file_id IN ?", fileIds).Delete(&BatchFilePart{}).Error
 }
 
 // GetBatchFile returns the file of a user. Content is loaded only on request.
@@ -127,6 +207,11 @@ func GetBatchFile(userId int, fileId string, withContent bool) (*BatchFile, erro
 	}
 	if err := query.First(file).Error; err != nil {
 		return nil, err
+	}
+	if withContent {
+		if err := loadBatchFileParts(file); err != nil {
+			return nil, err
+		}
 	}
 	return file, nil
 }
@@ -156,22 +241,35 @@ func ListBatchFiles(userId int, purpose string, after string, limit int) ([]*Bat
 	return files, hasMore, nil
 }
 
+// CountLiveBatchInputFiles counts the input files of a user that have not
+// expired.
+func CountLiveBatchInputFiles(userId int, now int64) (int64, error) {
+	var count int64
+	err := DB.Model(&BatchFile{}).
+		Where("user_id = ? AND purpose = ? AND (expires_at = 0 OR expires_at > ?)", userId, BatchFilePurposeInput, now).
+		Count(&count).Error
+	return count, err
+}
+
 // DeleteBatchFile deletes a file unless it is the input of an unfinished or
 // unsettled batch, whose settlement still reads it.
 func DeleteBatchFile(userId int, fileId string) error {
 	return DB.Transaction(func(tx *gorm.DB) error {
 		file := &BatchFile{}
-		if err := lockForUpdate(tx).Select("id").Where("file_id = ? AND user_id = ?", fileId, userId).First(file).Error; err != nil {
+		if err := lockForUpdate(tx).Select("id", "file_id").Where("file_id = ? AND user_id = ?", fileId, userId).First(file).Error; err != nil {
 			return err
 		}
 		var inUse int64
 		if err := tx.Model(&Batch{}).
-			Where("input_file_id = ? AND (status IN ? OR billing_state = ?)", fileId, unfinishedBatchStatuses, BatchBillingReserved).
+			Where("input_file_id = ? AND (status IN ? OR billing_state IN ?)", fileId, unfinishedBatchStatuses, unsettledBillingStates).
 			Count(&inUse).Error; err != nil {
 			return err
 		}
 		if inUse > 0 {
 			return ErrBatchFileInUse
+		}
+		if err := deleteBatchFileParts(tx, []string{file.FileId}); err != nil {
+			return err
 		}
 		return tx.Delete(&BatchFile{}, file.Id).Error
 	})
@@ -187,18 +285,32 @@ func HasExpiredBatchFiles(now int64) bool {
 // DeleteExpiredBatchFiles removes up to limit files whose retention ended,
 // except the inputs of batches not yet settled, whose settlement reads them.
 func DeleteExpiredBatchFiles(now int64, limit int) (int64, error) {
-	var ids []int
+	var files []*BatchFile
 	inUse := DB.Model(&Batch{}).Select("input_file_id").
-		Where("status IN ? OR billing_state = ?", unfinishedBatchStatuses, BatchBillingReserved)
-	if err := DB.Model(&BatchFile{}).Where("expires_at > 0 AND expires_at <= ?", now).
-		Where("file_id NOT IN (?)", inUse).Limit(limit).Pluck("id", &ids).Error; err != nil {
+		Where("status IN ? OR billing_state IN ?", unfinishedBatchStatuses, unsettledBillingStates)
+	if err := DB.Model(&BatchFile{}).Select("id", "file_id").Where("expires_at > 0 AND expires_at <= ?", now).
+		Where("file_id NOT IN (?)", inUse).Limit(limit).Find(&files).Error; err != nil {
 		return 0, err
 	}
-	if len(ids) == 0 {
+	if len(files) == 0 {
 		return 0, nil
 	}
-	result := DB.Where("id IN ?", ids).Delete(&BatchFile{})
-	return result.RowsAffected, result.Error
+	ids := make([]int, 0, len(files))
+	fileIds := make([]string, 0, len(files))
+	for _, file := range files {
+		ids = append(ids, file.Id)
+		fileIds = append(fileIds, file.FileId)
+	}
+	var deleted int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := deleteBatchFileParts(tx, fileIds); err != nil {
+			return err
+		}
+		result := tx.Where("id IN ?", ids).Delete(&BatchFile{})
+		deleted = result.RowsAffected
+		return result.Error
+	})
+	return deleted, err
 }
 
 func CreateBatch(batch *Batch) error {
@@ -241,42 +353,60 @@ func ListBatches(userId int, after string, limit int) ([]*Batch, bool, error) {
 	return batches, hasMore, nil
 }
 
-// HasUnfinishedBatches reports whether the poll task has work, either an
-// unfinished batch or a terminal one whose charge is not settled yet.
+// ListHeldBatches lists the batches waiting for an administrator, oldest
+// first.
+func ListHeldBatches(limit int) ([]*Batch, error) {
+	var batches []*Batch
+	err := DB.Where("billing_state = ?", BatchBillingHeld).Order("id asc").Limit(limit).Find(&batches).Error
+	return batches, err
+}
+
+// HasUnfinishedBatches reports whether the poll task has work: a batch that
+// still holds its reservation and is not waiting for an administrator.
 func HasUnfinishedBatches() bool {
 	var id int
-	err := DB.Model(&Batch{}).
-		Where("status IN ? OR billing_state = ?", unfinishedBatchStatuses, BatchBillingReserved).
-		Limit(1).Pluck("id", &id).Error
+	err := DB.Model(&Batch{}).Where("billing_state = ?", BatchBillingReserved).Limit(1).Pluck("id", &id).Error
 	return err == nil && id != 0
 }
 
-// FindDueBatches returns batches whose next poll time has come.
+// FindDueBatches returns batches whose next poll time has come. A held batch
+// waits for an administrator and is not polled.
 func FindDueBatches(now int64, limit int) ([]*Batch, error) {
 	var batches []*Batch
-	err := DB.Where("(status IN ? OR billing_state = ?) AND next_poll_at <= ?", unfinishedBatchStatuses, BatchBillingReserved, now).
+	err := DB.Where("billing_state = ? AND next_poll_at <= ?", BatchBillingReserved, now).
 		Order("next_poll_at asc").Limit(limit).Find(&batches).Error
 	return batches, err
 }
 
 // UpdateBatchIfStatus applies updates only while the batch still has
-// fromStatus, so concurrent writers cannot move it backwards.
+// fromStatus and is reserved, so concurrent writers cannot move it backwards
+// or touch a batch another node settled or held.
 func UpdateBatchIfStatus(batchId string, fromStatus string, updates map[string]any) (bool, error) {
 	updates["updated_at"] = GetDBTimestamp()
-	result := DB.Model(&Batch{}).Where("batch_id = ? AND status = ?", batchId, fromStatus).Updates(updates)
+	result := DB.Model(&Batch{}).Where("batch_id = ? AND status = ? AND billing_state = ?", batchId, fromStatus, BatchBillingReserved).Updates(updates)
 	return result.RowsAffected > 0, result.Error
 }
 
+// DelayBatchPoll pushes back the next poll of a reserved batch. It writes no
+// other column, so it succeeds when a larger update was rejected for its
+// content.
+func DelayBatchPoll(batchId string, pollFailures int, nextPollAt int64) error {
+	return DB.Model(&Batch{}).Where("batch_id = ? AND billing_state = ?", batchId, BatchBillingReserved).
+		Updates(map[string]any{"poll_failures": pollFailures, "next_poll_at": nextPollAt, "updated_at": GetDBTimestamp()}).Error
+}
+
 // SettleBatch records the terminal state, the output files and the final
-// charge in one transaction. It succeeds only for the caller that moves the
-// charge from reserved to settled, so funds are adjusted at most once.
-func SettleBatch(batchId string, updates map[string]any, files []*BatchFile) (bool, error) {
+// charge, and moves the money, in one transaction. It succeeds only for the
+// caller that moves the batch from fromState to settled, so funds move at
+// most once, and a failure leaves both the batch and the money unchanged.
+func SettleBatch(batchId string, fromState string, updates map[string]any, files []*BatchFile, funding *BatchFunding) (bool, *BatchFundingResult, error) {
 	won := false
+	var applied *BatchFundingResult
 	updates["billing_state"] = BatchBillingSettled
 	updates["updated_at"] = GetDBTimestamp()
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&Batch{}).
-			Where("batch_id = ? AND billing_state = ?", batchId, BatchBillingReserved).
+			Where("batch_id = ? AND billing_state = ?", batchId, fromState).
 			Updates(updates)
 		if result.Error != nil {
 			return result.Error
@@ -285,14 +415,41 @@ func SettleBatch(batchId string, updates map[string]any, files []*BatchFile) (bo
 			return nil
 		}
 		for _, file := range files {
-			if err := tx.Create(file).Error; err != nil {
+			if err := createBatchFile(tx, file); err != nil {
+				return err
+			}
+		}
+		if funding != nil {
+			var err error
+			if applied, err = applyBatchFunding(tx, funding); err != nil {
 				return err
 			}
 		}
 		won = true
 		return nil
 	})
-	return won, err
+	if err != nil || !won {
+		return false, nil, err
+	}
+	applied.syncCaches()
+	return true, applied, nil
+}
+
+// HoldBatch moves a reserved batch to held with updates, keeping its
+// reservation for an administrator. It reports whether this call did.
+func HoldBatch(batchId string, updates map[string]any) (bool, error) {
+	updates["billing_state"] = BatchBillingHeld
+	updates["updated_at"] = GetDBTimestamp()
+	result := DB.Model(&Batch{}).Where("batch_id = ? AND billing_state = ?", batchId, BatchBillingReserved).Updates(updates)
+	return result.RowsAffected > 0, result.Error
+}
+
+// ResumeHeldBatch returns a held batch to polling with updates.
+func ResumeHeldBatch(batchId string, updates map[string]any) (bool, error) {
+	updates["billing_state"] = BatchBillingReserved
+	updates["updated_at"] = GetDBTimestamp()
+	result := DB.Model(&Batch{}).Where("batch_id = ? AND billing_state = ?", batchId, BatchBillingHeld).Updates(updates)
+	return result.RowsAffected > 0, result.Error
 }
 
 // DeleteUnsubmittedBatch removes the record of a batch that never reached the

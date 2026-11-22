@@ -377,6 +377,7 @@ func migrateDB() error {
 		&AuthzRole{},
 		&UserAccessToken{},
 		&BatchFile{},
+		&BatchFilePart{},
 		&Batch{},
 	)
 	if err != nil {

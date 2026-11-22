@@ -186,3 +186,29 @@ func DeleteBatch(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"id": batchId, "object": "batch", "deleted": true})
 }
+
+// AdminListHeldBatches lists the batches whose upstream outcome could not be
+// read and that wait for an administrator.
+func AdminListHeldBatches(c *gin.Context) {
+	held, apiErr := batch.ListHeldBatches(batchListLimit(c))
+	if apiErr != nil {
+		common.ApiErrorMsg(c, apiErr.Text(c))
+		return
+	}
+	common.ApiSuccess(c, held)
+}
+
+// AdminResolveHeldBatch resumes, refunds or charges a held batch.
+func AdminResolveHeldBatch(c *gin.Context) {
+	var req batch.ResolveRequest
+	if err := common.UnmarshalBodyReusable(c, &req); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	resolved, apiErr := batch.ResolveHeldBatch(c, c.GetInt("id"), c.Param("id"), &req)
+	if apiErr != nil {
+		common.ApiErrorMsg(c, apiErr.Text(c))
+		return
+	}
+	common.ApiSuccess(c, resolved)
+}

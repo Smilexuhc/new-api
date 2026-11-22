@@ -28,6 +28,8 @@ type BatchSetting struct {
 	DefaultMaxOutputTokens int     `json:"default_max_output_tokens"`
 	PollIntervalSeconds    int     `json:"poll_interval_seconds"`
 	FileRetentionDays      int     `json:"file_retention_days"`
+	// MaxInputFilesPerUser bounds the unexpired input files a user stores.
+	MaxInputFilesPerUser int `json:"max_input_files_per_user"`
 }
 
 var batchSetting = BatchSetting{
@@ -36,6 +38,7 @@ var batchSetting = BatchSetting{
 	DefaultMaxOutputTokens: 4096,
 	PollIntervalSeconds:    60,
 	FileRetentionDays:      30,
+	MaxInputFilesPerUser:   100,
 }
 
 func init() {
@@ -79,6 +82,8 @@ func ValidateBatchOption(key string, value string) error {
 		return intInRange(15, 3600)
 	case "file_retention_days":
 		return intInRange(1, 3650)
+	case "max_input_files_per_user":
+		return intInRange(1, 100000)
 	default:
 		return invalid
 	}

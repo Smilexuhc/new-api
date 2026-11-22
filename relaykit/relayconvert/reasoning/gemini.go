@@ -218,7 +218,7 @@ func geminiDefaultEffort(model string) Effort {
 	case strings.HasPrefix(model, "gemini-4-argon-cyber-permissive"):
 		return EffortHigh
 	case strings.HasPrefix(model, "gemini-4-argon"), strings.HasPrefix(model, "gemini-4-carbon"),
-		strings.HasPrefix(model, "gemini-3.8-flash"):
+		strings.HasPrefix(model, "gemini-3.8-flash") && !strings.HasPrefix(model, "gemini-3.8-flash-lite"):
 		return EffortMedium
 	case strings.HasPrefix(model, "gemini-4-neon"), strings.HasPrefix(model, "gemini-4-hydrogen"):
 		return EffortHigh
@@ -526,7 +526,7 @@ func geminiLevelForEffort(model string, effort Effort) (string, error) {
 			return string(EffortHigh), nil
 		}
 	case strings.HasPrefix(model, "gemini-3.1-pro"), model == "gemini-pro-latest",
-		strings.HasPrefix(model, "gemini-3.8-flash"):
+		strings.HasPrefix(model, "gemini-3.8-flash") && !strings.HasPrefix(model, "gemini-3.8-flash-lite"):
 		if effort == EffortMinimal {
 			return string(EffortLow), nil
 		}

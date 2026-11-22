@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/relay/helper"
 )
@@ -25,6 +28,8 @@ type inputLine struct {
 	Model    string
 	// MaxOutputTokens is the output limit the request sets, or 0.
 	MaxOutputTokens int
+	// Choices is the number of completions the request asks for (n).
+	Choices int
 	// RawBody is the request body as uploaded, used to estimate its input
 	// tokens.
 	RawBody []byte
@@ -109,6 +114,12 @@ func parseInput(content []byte, endpoint string, maxRequests int) ([]*inputLine,
 			return nil, lineError(lineNumber, err.Error())
 		}
 		line.MaxOutputTokens = maxTokens
+		if line.Choices, err = readChoices(body); err != nil {
+			return nil, lineError(lineNumber, err.Error())
+		}
+		if err := checkBodyFields(body); err != nil {
+			return nil, lineError(lineNumber, err.Error())
+		}
 		if endpoint != "" {
 			if line.Model == "" {
 				return nil, lineError(lineNumber, "body.model is required")
@@ -148,6 +159,102 @@ func readMaxOutputTokens(body map[string]json.RawMessage) (int, error) {
 	return best, nil
 }
 
+// maxChoices bounds n, which multiplies the output a request may bill.
+const maxChoices = 8
+
+func readChoices(body map[string]json.RawMessage) (int, error) {
+	raw, ok := body["n"]
+	if !ok || string(raw) == "null" {
+		return 1, nil
+	}
+	var value float64
+	if err := common.Unmarshal(raw, &value); err != nil || value < 1 || value > maxChoices || value != math.Trunc(value) {
+		return 0, fmt.Errorf("n must be an integer from 1 to %d", maxChoices)
+	}
+	return int(value), nil
+}
+
+// batchBodyFields are the chat completion fields a batch request may set. A
+// field that changes what the upstream runs or bills beyond the priced model
+// and tokens, such as models, provider or plugins, is rejected, since the
+// batch is priced from its model and token usage only.
+var batchBodyFields = map[string]struct{}{
+	"model": {}, "messages": {}, "max_tokens": {}, "max_completion_tokens": {}, "stream": {},
+	"temperature": {}, "top_p": {}, "top_k": {}, "min_p": {}, "seed": {}, "stop": {}, "n": {},
+	"frequency_penalty": {}, "presence_penalty": {}, "repetition_penalty": {},
+	"logit_bias": {}, "logprobs": {}, "top_logprobs": {}, "response_format": {},
+	"tools": {}, "tool_choice": {}, "parallel_tool_calls": {}, "functions": {}, "function_call": {},
+	"reasoning": {}, "reasoning_effort": {}, "verbosity": {}, "user": {}, "metadata": {},
+	// Gemini bills its search grounding as a tool; other upstreams reject it.
+	"web_search_options": {},
+}
+
+// droppedBodyFields are removed before submission, as the synchronous relay
+// removes them by default; a batch has no stream and its own service tier.
+var droppedBodyFields = []string{"store", "stream_options", "service_tier", "safety_identifier", "prompt_cache_key", "inference_geo", "speed"}
+
+func checkBodyFields(body map[string]json.RawMessage) error {
+	for field := range body {
+		if _, ok := batchBodyFields[field]; ok || slices.Contains(droppedBodyFields, field) {
+			continue
+		}
+		return fmt.Errorf("body.%s is not supported in a batch", field)
+	}
+	return nil
+}
+
+// checkUpstreamFields rejects the fields an upstream would run without the
+// batch billing them.
+func (l *inputLine) checkUpstreamFields(channelType int) error {
+	if _, ok := l.Body["web_search_options"]; ok && channelType != constant.ChannelTypeGemini {
+		return errors.New("body.web_search_options is not supported in a batch on this channel")
+	}
+	tools, err := l.tools()
+	if err != nil {
+		return err
+	}
+	for _, tool := range tools {
+		if tool.Type != "function" {
+			return fmt.Errorf("tool type %q is not supported in a batch", tool.Type)
+		}
+	}
+	return nil
+}
+
+type batchTool struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name string `json:"name"`
+	} `json:"function"`
+}
+
+func (l *inputLine) tools() ([]batchTool, error) {
+	raw, ok := l.Body["tools"]
+	if !ok || string(raw) == "null" {
+		return nil, nil
+	}
+	var tools []batchTool
+	if err := common.Unmarshal(raw, &tools); err != nil {
+		return nil, errors.New("body.tools must be an array of tools")
+	}
+	return tools, nil
+}
+
+// searchesWeb reports whether a Gemini request may run Google Search
+// grounding: through web_search_options or the googleSearch pseudo tool.
+func (l *inputLine) searchesWeb() bool {
+	if _, ok := l.Body["web_search_options"]; ok {
+		return true
+	}
+	tools, _ := l.tools()
+	for _, tool := range tools {
+		if tool.Function.Name == "googleSearch" {
+			return true
+		}
+	}
+	return false
+}
+
 // outputLimit is the output limit the request is sent with: its own, or
 // defaultMaxOutput when it sets none.
 func (l *inputLine) outputLimit(defaultMaxOutput int) int {
@@ -157,6 +264,12 @@ func (l *inputLine) outputLimit(defaultMaxOutput int) int {
 	return defaultMaxOutput
 }
 
+// maxOutput is the most output the request can bill: its output limit for
+// each of its choices.
+func (l *inputLine) maxOutput(defaultMaxOutput int) int {
+	return l.outputLimit(defaultMaxOutput) * max(l.Choices, 1)
+}
+
 // upstreamBody returns the body with model replaced by the upstream model
 // name. A request without an output limit gets defaultMaxOutput as max_tokens,
 // so its output, and with it its charge, stays within the reservation.
@@ -164,6 +277,9 @@ func (l *inputLine) upstreamBody(upstreamModel string, defaultMaxOutput int) ([]
 	body := make(map[string]json.RawMessage, len(l.Body))
 	for key, value := range l.Body {
 		body[key] = value
+	}
+	for _, field := range droppedBodyFields {
+		delete(body, field)
 	}
 	modelValue, err := common.Marshal(upstreamModel)
 	if err != nil {

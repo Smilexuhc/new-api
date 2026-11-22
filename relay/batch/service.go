@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"maps"
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -24,6 +26,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -45,15 +48,30 @@ const (
 	// completionWindowDuration stands in for the expiry of an upstream batch
 	// that reports none.
 	completionWindowDuration = 24 * time.Hour
+	// submitSaveRetryInterval spaces the background saves of a submission
+	// whose upstream id could not be recorded.
+	submitSaveRetryInterval = 15 * time.Second
 	// upstreamLostAfter is how long past its expiry an unfinished batch keeps
-	// being polled before it is given up.
+	// being polled before it is held.
 	upstreamLostAfter = 7 * 24 * time.Hour
-	// notFoundPollsBeforeGiveUp is how many polls in a row must fail, the last
-	// with not found, before a batch is treated as gone upstream; a single
-	// not found can come from a proxy or a changed base URL.
-	notFoundPollsBeforeGiveUp = 4
-	maxPollBackoff            = 30 * time.Minute
-	pollBatchSize             = 100
+	// notFoundPollsBeforeHold is how many polls in a row the upstream must
+	// answer not found before a batch is held; a single not found can come
+	// from a proxy or a changed base URL.
+	notFoundPollsBeforeHold = 4
+	// unavailablePollsBeforeHold is how many failed polls a batch whose
+	// channel key is gone or rejected gets before it is held.
+	unavailablePollsBeforeHold = 4
+	// settleFailuresBeforeHold is how many failed polls a batch whose final
+	// state cannot be saved gets before it is held.
+	settleFailuresBeforeHold = 6
+	// retrieveTimeout bounds one read of an upstream batch, results included.
+	retrieveTimeout = 5 * time.Minute
+	pollWorkers     = 8
+	maxPollBackoff  = 30 * time.Minute
+	pollBatchSize   = 100
+	// maxRemoteMediaPerBatch bounds the media a batch makes the gateway
+	// download.
+	maxRemoteMediaPerBatch = 1000
 )
 
 func keyFingerprint(key string) string {
@@ -101,11 +119,18 @@ func UploadFile(userId int, tokenId int, purpose string, filename string, conten
 	if apiErr != nil {
 		return nil, apiErr
 	}
+	now := common.GetTimestamp()
+	stored, err := model.CountLiveBatchInputFiles(userId, now)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	if stored >= int64(setting.MaxInputFilesPerUser) {
+		return nil, newError(http.StatusTooManyRequests, "invalid_request_error", i18n.MsgBatchTooManyFiles, map[string]any{"Max": setting.MaxInputFilesPerUser})
+	}
 	fileId, err := newObjectId("file-")
 	if err != nil {
 		return nil, internalError(err)
 	}
-	now := common.GetTimestamp()
 	file := &model.BatchFile{
 		FileId:    fileId,
 		UserId:    userId,
@@ -292,34 +317,30 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		DefaultMaxOutputTokens: setting.DefaultMaxOutputTokens,
 	}
 
-	items := make([]SubmitItem, 0, len(lines))
-	bodies := make([][]byte, 0, len(lines))
 	converter, converts := adaptor.(RequestConverter)
-	inlineBytes := 0
+	bodies := make([][]byte, 0, len(lines))
+	remoteMedia := 0
 	for _, line := range lines {
+		if err := line.checkUpstreamFields(channel.Type); err != nil {
+			return nil, lineError(line.Line, err.Error())
+		}
 		body, err := line.upstreamBody(info.UpstreamModelName, setting.DefaultMaxOutputTokens)
 		if err != nil {
 			return nil, lineError(line.Line, err.Error())
 		}
 		if converts {
-			var request dto.GeneralOpenAIRequest
-			if err := common.Unmarshal(body, &request); err != nil {
-				return nil, lineError(line.Line, err.Error())
-			}
-			// Conversion downloads linked media; stop once the batch cannot
-			// fit the inline limit instead of downloading the rest.
-			if body, err = converter.ConvertRequest(c, info, &request); err != nil {
-				return nil, lineError(line.Line, err.Error())
-			}
-			if inlineBytes += len(body); inlineBytes > GeminiInlineRequestLimit {
-				return nil, submitError(ErrGeminiInlineTooLarge)
-			}
+			remoteMedia += remoteMediaCount(body)
 		}
-		items = append(items, SubmitItem{CustomId: line.CustomId, Body: body})
 		bodies = append(bodies, body)
 	}
+	if remoteMedia > maxRemoteMediaPerBatch {
+		return nil, newError(http.StatusBadRequest, "invalid_request_error", i18n.MsgBatchTooManyRemoteMedia, map[string]any{"Max": maxRemoteMediaPerBatch})
+	}
 
-	_, preConsume, clamp, err := estimateCharges(c, snapshot, lines, bodies)
+	// The reservation is taken before any linked media is downloaded, so a
+	// user who cannot pay downloads nothing. Media the adaptor downloads is
+	// reserved once its size is known.
+	_, preConsume, clamp, err := estimateChargesOf(c, snapshot, lines, bodies, converts)
 	if err != nil {
 		return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}
 	}
@@ -332,6 +353,50 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		if info.Billing != nil {
 			info.Billing.Refund(c)
 		}
+	}
+
+	if converts {
+		// Converted requests inline the media they link to; the batch must
+		// fit the inline limit, so downloads stop once they would exceed it.
+		service.SetDownloadBudget(c, GeminiInlineRequestLimit)
+		inlineBytes := 0
+		for index, line := range lines {
+			var request dto.GeneralOpenAIRequest
+			if err := common.Unmarshal(bodies[index], &request); err != nil {
+				refund()
+				return nil, lineError(line.Line, err.Error())
+			}
+			body, err := converter.ConvertRequest(c, info, &request)
+			if err != nil {
+				refund()
+				if isDownloadBudgetError(err) {
+					return nil, submitError(ErrGeminiInlineTooLarge)
+				}
+				return nil, lineError(line.Line, err.Error())
+			}
+			if inlineBytes += len(body); inlineBytes > GeminiInlineRequestLimit {
+				refund()
+				return nil, submitError(ErrGeminiInlineTooLarge)
+			}
+			bodies[index] = body
+		}
+		// The converted requests carry the media and are priced from it.
+		_, converted, convertedClamp, err := estimateCharges(c, snapshot, lines, bodies)
+		if err != nil {
+			refund()
+			return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}
+		}
+		if converted > preConsume {
+			if apiErr := service.PreConsumeBilling(c, converted, info); apiErr != nil {
+				refund()
+				return nil, billingErrorFrom(apiErr)
+			}
+			preConsume, clamp = converted, convertedClamp
+		}
+	}
+	items := make([]SubmitItem, 0, len(lines))
+	for index, line := range lines {
+		items = append(items, SubmitItem{CustomId: line.CustomId, Body: bodies[index]})
 	}
 
 	batchId, err := newObjectId("batch_")
@@ -375,6 +440,8 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		BillingSource:    info.BillingSource,
 		SubscriptionId:   info.SubscriptionId,
 		BillingContext:   string(snapshotJSON),
+
+		SubmissionUnrecorded: true,
 	}
 	// The row exists before the upstream call so a crash after submission
 	// leaves a record that the poller settles instead of a lost reservation.
@@ -383,7 +450,7 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		return nil, internalError(err)
 	}
 	// From here the record owns the reservation: every refund goes through
-	// its reserved-to-settled switch, so a refund cannot happen twice.
+	// its switch out of reserved, so a refund cannot happen twice.
 	if err := service.SettleBilling(c, info, preConsume); err != nil {
 		logger.LogError(c, common.LogText("batch %s: failed to confirm the reservation: %s", batchId, err.Error()))
 	}
@@ -405,6 +472,15 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		CompletionWindow: req.CompletionWindow,
 		Items:            items,
 	})
+	if errors.Is(err, ErrNoUpstreamId) {
+		// The upstream may run and bill the batch, which cannot be tracked;
+		// the reservation waits for an administrator.
+		if holdWith(c, b, "submission_unconfirmed", "the upstream accepted the batch without returning its id",
+			map[string]any{"submission_unrecorded": false}) {
+			recordSubmission(c, info, b, ratio, ratioSource, clamp)
+		}
+		return nil, submitError(err)
+	}
 	if err != nil {
 		// The client gets an error and no batch id, so the record goes too.
 		if releaseUnsubmitted(c, b, "submission_failed", err.Error()) {
@@ -424,24 +500,40 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 	if updates["status"] == model.BatchStatusInProgress {
 		updates["in_progress_at"] = now
 	}
-	if err := saveSubmission(batchId, updates); err != nil {
-		// Without the upstream id the poller refunds the batch, so the
-		// upstream batch is cancelled rather than left running unbilled.
-		logger.LogError(c, common.LogText("batch %s: submitted as %s but the record update failed, cancelling it upstream: %s", batchId, upstream.Id, err.Error()))
+	// The submission is counted with the save that marks it counted; a batch
+	// saved later by the retry is counted when it settles.
+	recorded := maps.Clone(updates)
+	recorded["submission_unrecorded"] = false
+	if err := saveSubmission(batchId, recorded); err != nil {
+		// The batch runs upstream and is billed once its id is saved. It is
+		// cancelled where the upstream can, and the save keeps being retried;
+		// a batch still without its id after the grace period is held.
+		logger.LogError(c, common.LogText("batch %s: submitted as %s but the record update failed, cancelling it upstream and retrying the save: %s", batchId, upstream.Id, err.Error()))
 		if _, cancelErr := adaptor.Cancel(submitCtx, conn, upstream.Id); cancelErr != nil {
-			logger.LogError(c, common.LogText("batch %s: failed to cancel upstream batch %s, which keeps running unbilled: %s", batchId, upstream.Id, cancelErr.Error()))
+			logger.LogError(c, common.LogText("batch %s: failed to cancel upstream batch %s: %s", batchId, upstream.Id, cancelErr.Error()))
 		}
+		retrySubmissionSave(batchId, upstream.Id, b.CreatedAt, updates)
 		return nil, internalError(err)
 	}
-	recordSubmitLog(c, info, b, ratio, ratioSource, clamp)
-	model.UpdateUserUsedQuotaAndRequestCount(userId, preConsume)
-	model.UpdateChannelUsedQuota(channel.Id, preConsume)
+	recordSubmission(c, info, b, ratio, ratioSource, clamp)
 
 	fresh, err := model.GetBatch(userId, batchId)
 	if err != nil {
 		return b, nil
 	}
 	return fresh, nil
+}
+
+func isDownloadBudgetError(err error) bool {
+	return errors.Is(err, service.ErrDownloadBudgetExceeded) || strings.Contains(err.Error(), service.ErrDownloadBudgetExceeded.Error())
+}
+
+// recordSubmission logs the reservation of a batch the upstream accepted and
+// counts it in the usage statistics.
+func recordSubmission(c *gin.Context, info *relaycommon.RelayInfo, b *model.Batch, ratio float64, ratioSource string, clamp *common.QuotaClamp) {
+	recordSubmitLog(c, info, b, ratio, ratioSource, clamp)
+	model.UpdateUserUsedQuotaAndRequestCount(b.UserId, b.Quota)
+	model.UpdateChannelUsedQuota(b.ChannelId, b.Quota)
 }
 
 // saveSubmission records the upstream id of a submitted batch, retrying
@@ -463,29 +555,42 @@ func saveSubmission(batchId string, updates map[string]any) error {
 	return err
 }
 
+// retrySubmissionSave keeps saving the upstream id in the background until
+// shortly before the grace period ends.
+func retrySubmissionSave(batchId string, upstreamId string, createdAt int64, updates map[string]any) {
+	deadline := time.Unix(createdAt, 0).Add(submitGracePeriod - submitSaveRetryInterval)
+	gopool.Go(func() {
+		for time.Now().Before(deadline) {
+			time.Sleep(submitSaveRetryInterval)
+			saved, err := model.UpdateBatchIfStatus(batchId, model.BatchStatusValidating, maps.Clone(updates))
+			if err == nil {
+				if saved {
+					common.SysLog(common.LogText("batch %s: saved upstream batch %s after retrying", batchId, upstreamId))
+				}
+				return
+			}
+		}
+		common.SysError(common.LogText("batch %s: could not save upstream batch %s; it will be held for review", batchId, upstreamId))
+	})
+}
+
 // releaseUnsubmitted marks a batch that never reached the upstream failed and
-// refunds its reservation, reporting whether this call did. When the record
-// cannot be switched to settled the batch stays reserved and the poller
-// refunds it after the grace period.
+// refunds its reservation in the same transaction, reporting whether this
+// call did. When the record cannot be switched the batch stays reserved and
+// the poller holds it after the grace period.
 func releaseUnsubmitted(ctx context.Context, b *model.Batch, code string, reason string) bool {
-	won, err := model.SettleBatch(b.BatchId, map[string]any{
+	settlement := batchSettlement(b, 0)
+	won, _, err := model.SettleBatch(b.BatchId, model.BatchBillingReserved, map[string]any{
 		"status":    model.BatchStatusFailed,
 		"failed_at": common.GetTimestamp(),
 		"errors":    batchErrorsJSON(code, reason),
 		"quota":     0,
-	}, nil)
+	}, nil, service.BatchFunding(settlement))
 	if err != nil {
-		logger.LogError(ctx, common.LogText("batch %s: failed to release the reservation of an unsubmitted batch, the poller will: %s", b.BatchId, err.Error()))
+		logger.LogError(ctx, common.LogText("batch %s: failed to release the reservation of an unsubmitted batch: %s", b.BatchId, err.Error()))
 		return false
 	}
-	if !won {
-		return false
-	}
-	if err := service.ReleaseBatchReservation(ctx, batchSettlement(b, 0)); err != nil {
-		logger.LogError(ctx, common.LogText("batch %s is settled in the database but its reservation %d was not refunded; reconcile by hand: %s",
-			b.BatchId, b.Quota, err.Error()))
-	}
-	return true
+	return won
 }
 
 // nonTerminalStatus keeps a just-submitted batch out of terminal states; a
@@ -509,6 +614,9 @@ func submitError(err error) *Error {
 			status = upstreamErr.StatusCode
 		}
 		return newError(status, "upstream_error", i18n.MsgBatchUpstreamError, map[string]any{"Message": upstreamErr.Message})
+	}
+	if errors.Is(err, ErrNoUpstreamId) {
+		return newError(http.StatusBadGateway, "upstream_error", i18n.MsgBatchUpstreamError, map[string]any{"Message": err.Error()})
 	}
 	common.SysError(common.LogText("batch submission failed: %s", err.Error()))
 	return newError(http.StatusBadGateway, "upstream_error", i18n.MsgBatchUpstreamError, map[string]any{"Message": "the upstream could not be reached"})
@@ -561,12 +669,17 @@ func recordSubmitLog(c *gin.Context, info *relaycommon.RelayInfo, b *model.Batch
 // Poll and finalize
 // ---------------------------------------------------------------------------
 
+var errConnectionGone = errors.New("the channel key that submitted the batch is gone")
+
 func resolveConnection(b *model.Batch) (*Connection, Adaptor, error) {
 	adaptor := GetAdaptor(b.ChannelType)
 	if adaptor == nil {
 		return nil, nil, errors.New("no batch adaptor for the channel type")
 	}
 	channel, err := model.GetChannelById(b.ChannelId, true)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil, errConnectionGone
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -580,11 +693,12 @@ func resolveConnection(b *model.Batch) (*Connection, Adaptor, error) {
 			}, adaptor, nil
 		}
 	}
-	return nil, nil, errors.New("the channel key that submitted the batch is gone")
+	return nil, nil, errConnectionGone
 }
 
-// PollOnce refreshes the batches whose poll time has come. It returns the
-// number of batches it looked at.
+// PollOnce refreshes the batches whose poll time has come, a few at a time so
+// one slow upstream does not hold up the others. It returns the number of
+// batches it looked at.
 func PollOnce(ctx context.Context) int {
 	now := common.GetTimestamp()
 	batches, err := model.FindDueBatches(now, pollBatchSize)
@@ -592,9 +706,23 @@ func PollOnce(ctx context.Context) int {
 		logger.LogError(ctx, common.LogText("batch poll: failed to load due batches: %s", err.Error()))
 		return 0
 	}
+	workers := make(chan struct{}, pollWorkers)
+	var wg sync.WaitGroup
 	for _, b := range batches {
-		refreshBatch(ctx, b, now)
+		wg.Add(1)
+		workers <- struct{}{}
+		go func(b *model.Batch) {
+			defer wg.Done()
+			defer func() { <-workers }()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					logger.LogError(ctx, common.LogText("batch %s: poll panicked: %v", b.BatchId, recovered))
+				}
+			}()
+			refreshBatch(ctx, b, now)
+		}(b)
 	}
+	wg.Wait()
 	if deleted, err := model.DeleteExpiredBatchFiles(now, pollBatchSize); err != nil {
 		logger.LogWarn(ctx, common.LogText("batch poll: failed to delete expired files: %s", err.Error()))
 	} else if deleted > 0 {
@@ -607,16 +735,34 @@ func pollInterval() int64 {
 	return int64(operation_setting.GetBatchSetting().PollIntervalSeconds)
 }
 
-func backoff(ctx context.Context, b *model.Batch, now int64, reason string) {
-	failures := b.PollFailures + 1
+func backoffDelay(failures int) int64 {
 	delay := pollInterval() << min(failures, 10)
-	delay = min(delay, int64(maxPollBackoff.Seconds()))
+	return min(delay, int64(maxPollBackoff.Seconds()))
+}
+
+// backoff pushes back the next poll of a batch whose poll failed.
+// notFoundPolls is the number of polls in a row the upstream answered not
+// found.
+func backoff(ctx context.Context, b *model.Batch, now int64, notFoundPolls int, reason string) {
+	failures := b.PollFailures + 1
+	delay := backoffDelay(failures)
 	logger.LogWarn(ctx, common.LogText("batch %s poll failed (%d in a row), next try in %ds: %s", b.BatchId, failures, delay, reason))
 	if _, err := model.UpdateBatchIfStatus(b.BatchId, b.Status, map[string]any{
-		"poll_failures": failures,
-		"next_poll_at":  now + delay,
+		"poll_failures":   failures,
+		"not_found_polls": notFoundPolls,
+		"next_poll_at":    now + delay,
 	}); err != nil {
 		logger.LogError(ctx, common.LogText("batch %s: failed to record the poll failure: %s", b.BatchId, err.Error()))
+		delayPoll(ctx, b, now)
+	}
+}
+
+// delayPoll pushes back the next poll after a write of the batch failed,
+// writing only the poll columns.
+func delayPoll(ctx context.Context, b *model.Batch, now int64) {
+	failures := b.PollFailures + 1
+	if err := model.DelayBatchPoll(b.BatchId, failures, now+backoffDelay(failures)); err != nil {
+		logger.LogError(ctx, common.LogText("batch %s: failed to delay its next poll: %s", b.BatchId, err.Error()))
 	}
 }
 
@@ -629,33 +775,44 @@ func upstreamDeadline(b *model.Batch) int64 {
 	return b.CreatedAt + int64(completionWindowDuration.Seconds())
 }
 
+func isUpstreamAuthError(err error) bool {
+	var upstreamErr *UpstreamError
+	return errors.As(err, &upstreamErr) && (upstreamErr.StatusCode == http.StatusUnauthorized || upstreamErr.StatusCode == http.StatusForbidden)
+}
+
 func refreshBatch(ctx context.Context, b *model.Batch, now int64) {
 	if b.UpstreamBatchId == "" {
 		if now-b.CreatedAt >= int64(submitGracePeriod.Seconds()) {
-			logger.LogError(ctx, common.LogText("batch %s (channel %d) has no upstream id after the grace period; refunding its reservation %d",
-				b.BatchId, b.ChannelId, b.Quota))
-			releaseUnsubmitted(ctx, b, "submission_lost", "the submission did not complete")
+			hold(ctx, b, "submission_unconfirmed", "the submission was not confirmed and may have reached the upstream")
 		}
 		return
 	}
 	lost := now > upstreamDeadline(b)+int64(upstreamLostAfter.Seconds())
 	conn, adaptor, err := resolveConnection(b)
 	if err != nil {
-		if lost {
-			giveUp(ctx, b, "upstream_unreachable", err.Error(), b.Quota)
+		if lost || (errors.Is(err, errConnectionGone) && b.PollFailures+1 >= unavailablePollsBeforeHold) {
+			holdUnreadable(ctx, b, "channel_unavailable", err)
 			return
 		}
-		backoff(ctx, b, now, err.Error())
+		backoff(ctx, b, now, 0, err.Error())
 		return
 	}
-	upstream, err := adaptor.Retrieve(ctx, conn, b.UpstreamBatchId)
+	retrieveCtx, cancel := context.WithTimeout(ctx, retrieveTimeout)
+	defer cancel()
+	upstream, err := adaptor.Retrieve(retrieveCtx, conn, b.UpstreamBatchId)
 	if err != nil {
-		gone := IsUpstreamNotFound(err) && b.PollFailures+1 >= notFoundPollsBeforeGiveUp
-		if gone || lost {
-			giveUp(ctx, b, "upstream_unavailable", err.Error(), b.Quota)
-			return
+		notFoundPolls := 0
+		if IsUpstreamNotFound(err) {
+			notFoundPolls = b.NotFoundPolls + 1
 		}
-		backoff(ctx, b, now, err.Error())
+		switch {
+		case lost, notFoundPolls >= notFoundPollsBeforeHold:
+			holdUnreadable(ctx, b, "upstream_unavailable", err)
+		case isUpstreamAuthError(err) && b.PollFailures+1 >= unavailablePollsBeforeHold:
+			holdUnreadable(ctx, b, "channel_unauthorized", err)
+		default:
+			backoff(ctx, b, now, notFoundPolls, err.Error())
+		}
 		return
 	}
 	if isTerminalStatus(upstream.Status) && upstream.ResultsReady {
@@ -663,22 +820,16 @@ func refreshBatch(ctx context.Context, b *model.Batch, now int64) {
 		return
 	}
 	if lost {
-		giveUp(ctx, b, "upstream_unavailable", "the upstream batch did not finish", b.Quota)
+		hold(ctx, b, "upstream_unfinished", "the upstream batch did not finish or return its results")
 		return
 	}
-	status := upstream.Status
-	if isTerminalStatus(status) {
-		status = model.BatchStatusFinalizing
-	}
-	// A requested cancellation stays visible until the upstream ends the batch.
-	if b.Status == model.BatchStatusCancelling {
-		status = model.BatchStatusCancelling
-	}
+	status := nextStatus(b.Status, upstream.Status)
 	updates := map[string]any{
 		"status":            status,
 		"request_completed": upstream.Completed,
 		"request_failed":    upstream.Failed,
 		"poll_failures":     0,
+		"not_found_polls":   0,
 		"next_poll_at":      now + pollInterval(),
 	}
 	if upstream.Total > 0 {
@@ -695,35 +846,69 @@ func refreshBatch(ctx context.Context, b *model.Batch, now int64) {
 	}
 	if _, err := model.UpdateBatchIfStatus(b.BatchId, b.Status, updates); err != nil {
 		logger.LogError(ctx, common.LogText("batch %s: failed to save the upstream state: %s", b.BatchId, err.Error()))
+		delayPoll(ctx, b, now)
 	}
 }
 
-// giveUp ends a batch whose upstream state can no longer be read. quota is
-// what it is charged: nothing when it never reached the upstream, the
-// reservation when the upstream may have billed it.
-func giveUp(ctx context.Context, b *model.Batch, code string, reason string, quota int) {
-	logger.LogError(ctx, common.LogText("batch %s (upstream %s, channel %d) is given up and marked failed with charge %d of reserved %d: %s",
-		b.BatchId, b.UpstreamBatchId, b.ChannelId, quota, b.Quota, reason))
-	now := common.GetTimestamp()
-	updates := map[string]any{
-		"status":    model.BatchStatusFailed,
-		"failed_at": now,
-		"errors":    batchErrorsJSON(code, reason),
-		"quota":     quota,
+var statusRank = map[string]int{
+	model.BatchStatusValidating: 0,
+	model.BatchStatusInProgress: 1,
+	model.BatchStatusFinalizing: 2,
+}
+
+// nextStatus is the status an unfinished batch moves to for the upstream
+// status: an unknown status keeps it, a terminal one without results yet
+// shows as finalizing, a requested cancellation stays visible until the
+// upstream ends the batch, and a batch never moves back.
+func nextStatus(current string, upstream string) string {
+	if current == model.BatchStatusCancelling {
+		return current
 	}
-	won, err := model.SettleBatch(b.BatchId, updates, nil)
+	if isTerminalStatus(upstream) {
+		upstream = model.BatchStatusFinalizing
+	}
+	if upstream == model.BatchStatusCancelling {
+		return upstream
+	}
+	rank, known := statusRank[upstream]
+	if !known || rank < statusRank[current] {
+		return current
+	}
+	return upstream
+}
+
+// holdUnreadable holds a batch whose upstream state cannot be read. The
+// reason the user sees names no address; the error is logged for admins.
+func holdUnreadable(ctx context.Context, b *model.Batch, code string, err error) {
+	logger.LogError(ctx, common.LogText("batch %s (upstream %s, channel %d): %s", b.BatchId, b.UpstreamBatchId, b.ChannelId, err.Error()))
+	hold(ctx, b, code, "the upstream state of the batch could not be read")
+}
+
+// hold stops polling a batch whose outcome cannot be determined and keeps its
+// reservation until an administrator resumes, refunds or charges it.
+func hold(ctx context.Context, b *model.Batch, code string, reason string) {
+	holdWith(ctx, b, code, reason, nil)
+}
+
+// holdWith is hold, saving updates with the hold, and reports whether the
+// hold was saved.
+func holdWith(ctx context.Context, b *model.Batch, code string, reason string, updates map[string]any) bool {
+	logger.LogError(ctx, common.LogText("batch %s (upstream %s, channel %d) is held for review with reservation %d: %s: %s",
+		b.BatchId, b.UpstreamBatchId, b.ChannelId, b.Quota, code, reason))
+	if updates == nil {
+		updates = map[string]any{}
+	}
+	updates["errors"] = batchErrorsJSON(code, heldMessage(reason))
+	held, err := model.HoldBatch(b.BatchId, updates)
 	if err != nil {
-		logger.LogError(ctx, common.LogText("batch %s: failed to mark the batch failed: %s", b.BatchId, err.Error()))
-		return
+		logger.LogError(ctx, common.LogText("batch %s: failed to hold the batch: %s", b.BatchId, err.Error()))
+		delayPoll(ctx, b, common.GetTimestamp())
 	}
-	if !won {
-		return
-	}
-	other := model.NewLogOther()
-	other.SetAdmin("upstream_batch_id", b.UpstreamBatchId)
-	other.SetAdmin("reason", reason)
-	settle(ctx, b, quota, 0, 0, []*common.Message{common.NewMessage("Batch {{batch}} failed because its upstream state could not be read ({{code}})",
-		map[string]any{"batch": b.BatchId, "code": code})}, other)
+	return held
+}
+
+func heldMessage(reason string) string {
+	return reason + "; the reservation is kept until an administrator settles the batch"
 }
 
 func batchSettlement(b *model.Batch, actual int) service.BatchSettlement {
@@ -738,26 +923,24 @@ func batchSettlement(b *model.Batch, actual int) service.BatchSettlement {
 		SubscriptionId: b.SubscriptionId,
 		PreConsumed:    b.Quota,
 		Actual:         actual,
+		Uncounted:      b.SubmissionUnrecorded,
 	}
 }
 
-func settle(ctx context.Context, b *model.Batch, actual int, promptTokens int, completionTokens int, content []*common.Message, other *model.LogOther) {
-	settlement := batchSettlement(b, actual)
-	settlement.PromptTokens = promptTokens
-	settlement.CompletionTokens = completionTokens
-	settlement.Content = content
-	settlement.Other = other
-	if err := service.SettleBatchCharge(ctx, settlement); err != nil {
-		logger.LogError(ctx, common.LogText("batch %s is settled in the database but its funds were not adjusted (actual %d, reserved %d); reconcile by hand: %s",
-			b.BatchId, actual, b.Quota, err.Error()))
+// finalStatus is the status a batch ends with: a batch the user cancelled
+// ends cancelled even when the upstream reports it completed.
+func finalStatus(current string, upstream string) string {
+	if current == model.BatchStatusCancelling && upstream == model.BatchStatusCompleted {
+		return model.BatchStatusCancelled
 	}
+	return upstream
 }
 
 func finalize(ctx context.Context, b *model.Batch, upstream *UpstreamBatch) {
 	var snapshot billingSnapshot
 	if err := common.Unmarshal([]byte(b.BillingContext), &snapshot); err != nil {
-		logger.LogError(ctx, common.LogText("batch %s: unreadable billing snapshot, keeping the reservation: %s", b.BatchId, err.Error()))
-		giveUp(ctx, b, "billing_snapshot_invalid", err.Error(), b.Quota)
+		logger.LogError(ctx, common.LogText("batch %s: unreadable billing snapshot: %s", b.BatchId, err.Error()))
+		hold(ctx, b, "billing_snapshot_invalid", "the batch price could not be read")
 		return
 	}
 	var lines []*inputLine
@@ -767,21 +950,27 @@ func finalize(ctx context.Context, b *model.Batch, upstream *UpstreamBatch) {
 		logger.LogWarn(ctx, common.LogText("batch %s: input file unavailable at settlement: %s", b.BatchId, err.Error()))
 	}
 	settlement := buildSettlement(b, &snapshot, lines, upstream)
+	if settlement.Summary.Unexpected > 0 {
+		logger.LogWarn(ctx, common.LogText("batch %s: the upstream returned %d results the input does not list; they are not charged",
+			b.BatchId, settlement.Summary.Unexpected))
+	}
 
 	now := common.GetTimestamp()
+	status := finalStatus(b.Status, upstream.Status)
 	files := make([]*model.BatchFile, 0, 2)
 	updates := map[string]any{
-		"status":            upstream.Status,
+		"status":            status,
 		"request_completed": settlement.Summary.Succeeded,
 		"request_failed":    settlement.Summary.Failed + settlement.Summary.NotProcessed,
 		"quota":             settlement.Summary.Quota,
 		"usage_summary":     settlement.summaryJSON(),
 		"poll_failures":     0,
+		"not_found_polls":   0,
 	}
 	if b.RequestTotal == 0 {
 		updates["request_total"] = len(settlement.Output) + len(settlement.Errors)
 	}
-	switch upstream.Status {
+	switch status {
 	case model.BatchStatusCompleted:
 		updates["completed_at"] = now
 	case model.BatchStatusFailed:
@@ -808,7 +997,7 @@ func finalize(ctx context.Context, b *model.Batch, upstream *UpstreamBatch) {
 		}
 		fileId, err := newObjectId("file-")
 		if err != nil {
-			backoff(ctx, b, now, "failed to create a file id: "+err.Error())
+			backoff(ctx, b, now, 0, "failed to create a file id: "+err.Error())
 			return
 		}
 		files = append(files, &model.BatchFile{
@@ -826,16 +1015,23 @@ func finalize(ctx context.Context, b *model.Batch, upstream *UpstreamBatch) {
 		updates[part.column] = fileId
 	}
 
-	won, err := model.SettleBatch(b.BatchId, updates, files)
+	summary := settlement.Summary
+	charge := batchSettlement(b, summary.Quota)
+	won, applied, err := model.SettleBatch(b.BatchId, model.BatchBillingReserved, updates, files, service.BatchFunding(charge))
 	if err != nil {
-		// Each retry downloads the results again, so it backs off.
-		backoff(ctx, b, now, "failed to save the final state: "+err.Error())
+		// Each retry downloads the results again, so it backs off; a batch
+		// that keeps failing to save is held rather than retried forever.
+		if b.PollFailures+1 >= settleFailuresBeforeHold {
+			logger.LogError(ctx, common.LogText("batch %s: failed to save the final state: %s", b.BatchId, err.Error()))
+			hold(ctx, b, "settlement_failed", "the final state of the batch could not be saved")
+			return
+		}
+		backoff(ctx, b, now, 0, "failed to save the final state: "+err.Error())
 		return
 	}
 	if !won {
 		return
 	}
-	summary := settlement.Summary
 	other := model.NewLogOther()
 	other.SetPublic("request_count", b.RequestTotal)
 	other.SetPublic("succeeded", summary.Succeeded)
@@ -851,15 +1047,36 @@ func finalize(ctx context.Context, b *model.Batch, upstream *UpstreamBatch) {
 	if summary.EstimatedItems > 0 {
 		other.SetPublic("estimated_items", summary.EstimatedItems)
 	}
-	other.SetAdmin("upstream_batch_id", b.UpstreamBatchId)
-	if summary.UpstreamCostUSD != nil {
-		other.SetAdmin("upstream_cost_usd", *summary.UpstreamCostUSD)
+	if summary.GroundingQueries > 0 {
+		other.SetPublic("grounding_queries", summary.GroundingQueries)
 	}
+	other.SetAdmin("upstream_batch_id", b.UpstreamBatchId)
+	if summary.Unexpected > 0 {
+		other.SetAdmin("unexpected_results", summary.Unexpected)
+	}
+	noteUpstreamCost(ctx, b, summary, other)
 	noteQuotaSaturation(ctx, b, settlement.QuotaClamp, other)
-	settle(ctx, b, summary.Quota, summary.PromptTokens, summary.CompletionTokens,
-		[]*common.Message{common.NewMessage("Batch {{batch}} ended as {{status}}: {{succeeded}} succeeded, {{failed}} failed; charged from upstream usage",
-			map[string]any{"batch": b.BatchId, "status": upstream.Status, "succeeded": summary.Succeeded, "failed": summary.Failed + summary.NotProcessed})},
-		other)
+	charge.PromptTokens = summary.PromptTokens
+	charge.CompletionTokens = summary.CompletionTokens
+	charge.Content = []*common.Message{common.NewMessage("Batch {{batch}} ended as {{status}}: {{succeeded}} succeeded, {{failed}} failed; charged from upstream usage",
+		map[string]any{"batch": b.BatchId, "status": status, "succeeded": summary.Succeeded, "failed": summary.Failed + summary.NotProcessed})}
+	charge.Other = other
+	service.RecordBatchSettlement(ctx, charge, applied)
+}
+
+// noteUpstreamCost records the cost the upstream reports and warns when it
+// exceeds the charge, which the token prices then do not cover.
+func noteUpstreamCost(ctx context.Context, b *model.Batch, summary usageSummary, other *model.LogOther) {
+	if summary.UpstreamCostUSD == nil {
+		return
+	}
+	other.SetAdmin("upstream_cost_usd", *summary.UpstreamCostUSD)
+	costQuota := *summary.UpstreamCostUSD * common.QuotaPerUnit
+	if costQuota > float64(summary.Quota) {
+		other.SetAdmin("upstream_cost_exceeds_charge", true)
+		logger.LogWarn(ctx, common.LogText("batch %s: upstream cost $%.6f (%.0f quota) exceeds the charge %d; check the model price",
+			b.BatchId, *summary.UpstreamCostUSD, costQuota, summary.Quota))
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +1142,129 @@ func DeleteBatch(c *gin.Context, batchId string) *Error {
 		return internalError(err)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Held batches
+// ---------------------------------------------------------------------------
+
+const (
+	ResolveActionResume = "resume"
+	ResolveActionRefund = "refund"
+	ResolveActionCharge = "charge"
+)
+
+type ResolveRequest struct {
+	Action string `json:"action"`
+	// Quota is the charge of a charge action; it defaults to the reservation.
+	Quota *int   `json:"quota"`
+	Note  string `json:"note"`
+}
+
+// HeldBatch is a held batch as an administrator sees it.
+type HeldBatch struct {
+	BatchObject
+	UserId          int    `json:"user_id"`
+	ChannelId       int    `json:"channel_id"`
+	UpstreamBatchId string `json:"upstream_batch_id"`
+	ReservedQuota   int    `json:"reserved_quota"`
+	BillingSource   string `json:"billing_source"`
+}
+
+func newHeldBatch(b *model.Batch) HeldBatch {
+	return HeldBatch{
+		BatchObject:     NewBatchObject(b),
+		UserId:          b.UserId,
+		ChannelId:       b.ChannelId,
+		UpstreamBatchId: b.UpstreamBatchId,
+		ReservedQuota:   b.Quota,
+		BillingSource:   b.BillingSource,
+	}
+}
+
+func ListHeldBatches(limit int) ([]HeldBatch, *Error) {
+	batches, err := model.ListHeldBatches(limit)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	held := make([]HeldBatch, 0, len(batches))
+	for _, b := range batches {
+		held = append(held, newHeldBatch(b))
+	}
+	return held, nil
+}
+
+// ResolveHeldBatch ends the hold of a batch: resume polls it again, refund
+// returns its reservation and charge settles it at a set quota. adminId is
+// recorded in the log.
+func ResolveHeldBatch(ctx context.Context, adminId int, batchId string, req *ResolveRequest) (*HeldBatch, *Error) {
+	b, err := model.GetBatchByBatchId(batchId)
+	if err != nil {
+		return nil, notFoundOr(err, i18n.MsgBatchNotFound)
+	}
+	if b.BillingState != model.BatchBillingHeld {
+		return nil, newError(http.StatusConflict, "invalid_request_error", i18n.MsgBatchNotHeld, nil)
+	}
+	now := common.GetTimestamp()
+	switch req.Action {
+	case ResolveActionResume:
+		if _, err := model.ResumeHeldBatch(batchId, map[string]any{
+			"poll_failures":   0,
+			"not_found_polls": 0,
+			"next_poll_at":    now,
+			"errors":          "",
+		}); err != nil {
+			return nil, internalError(err)
+		}
+	case ResolveActionRefund, ResolveActionCharge:
+		quota := 0
+		if req.Action == ResolveActionCharge {
+			quota = b.Quota
+			if req.Quota != nil {
+				quota = *req.Quota
+			}
+			if quota < 0 {
+				return nil, newError(http.StatusBadRequest, "invalid_request_error", i18n.MsgBatchInvalidResolution, nil)
+			}
+		}
+		status := b.Status
+		updates := map[string]any{"quota": quota, "poll_failures": 0}
+		if !isTerminalStatus(status) {
+			status = model.BatchStatusFailed
+			updates["status"] = status
+			updates["failed_at"] = now
+		}
+		reason := "settled by an administrator"
+		if req.Note != "" {
+			reason += ": " + req.Note
+		}
+		updates["errors"] = batchErrorsJSON("resolved_by_admin", reason)
+		charge := batchSettlement(b, quota)
+		won, applied, err := model.SettleBatch(batchId, model.BatchBillingHeld, updates, nil, service.BatchFunding(charge))
+		if err != nil {
+			return nil, internalError(err)
+		}
+		if won {
+			other := model.NewLogOther()
+			other.SetAdmin("upstream_batch_id", b.UpstreamBatchId)
+			other.SetAdmin("resolved_by", adminId)
+			if req.Note != "" {
+				other.SetAdmin("resolution_note", req.Note)
+			}
+			charge.Content = []*common.Message{common.NewMessage("Batch {{batch}} was settled by an administrator after its upstream outcome could not be read",
+				map[string]any{"batch": b.BatchId})}
+			charge.Other = other
+			service.RecordBatchSettlement(ctx, charge, applied)
+		}
+	default:
+		return nil, newError(http.StatusBadRequest, "invalid_request_error", i18n.MsgBatchInvalidResolution, nil)
+	}
+	fresh, err := model.GetBatchByBatchId(batchId)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	held := newHeldBatch(fresh)
+	return &held, nil
 }
 
 func ListBatches(userId int, after string, limit int) (ListObject[BatchObject], *Error) {

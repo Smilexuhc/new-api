@@ -360,10 +360,10 @@ func TestGeminiVideoBatchOverTheInlineLimitStopsDownloading(t *testing.T) {
 	require.NotNil(t, apiErr)
 	assert.Equal(t, http.StatusBadRequest, apiErr.Status)
 	assert.Equal(t, i18n.MsgBatchInlineTooLarge, apiErr.MsgID)
-	assert.EqualValues(t, 2, media.hits.Load(), "the third video is not downloaded")
+	assert.EqualValues(t, 1, media.hits.Load(), "a link repeated across requests is downloaded once")
 	assert.Zero(t, upstream.submits)
 	assert.Zero(t, countBatches(t))
-	assert.Equal(t, startQuota, userQuota(t, testUser), "nothing is reserved")
+	assert.Eventually(t, func() bool { return userQuota(t, testUser) == startQuota }, 2*time.Second, 10*time.Millisecond, "the reservation is refunded")
 }
 
 // ---------------------------------------------------------------------------
@@ -463,8 +463,10 @@ func TestRejectedSubmissionIsRefundedOnceWhenTheRecordCannotBeSettled(t *testing
 
 	require.NoError(t, model.DB.Model(&model.Batch{}).Where("id = ?", left.Id).Update("created_at", time.Now().Add(-time.Hour).Unix()).Error)
 	lost := poll(t, left.BatchId)
-	assert.Equal(t, model.BatchStatusFailed, lost.Status)
-	assert.Contains(t, lost.Errors, "submission_lost")
+	assert.Equal(t, model.BatchBillingHeld, lost.BillingState)
+	assert.Contains(t, lost.Errors, "submission_unconfirmed")
+	assert.Equal(t, startQuota-left.Quota, userQuota(t, testUser))
+	resolve(t, left.BatchId, ResolveActionRefund, nil)
 	assert.Equal(t, startQuota, userQuota(t, testUser))
 	assert.Equal(t, startQuota, tokenRemain(t, testToken))
 	poll(t, left.BatchId)
@@ -535,7 +537,9 @@ func TestUnsavedSubmissionIsCancelledUpstreamAndRefundedOnce(t *testing.T) {
 	require.NoError(t, model.DB.Where("user_id = ?", testUser).First(&left).Error)
 	require.Empty(t, left.UpstreamBatchId)
 	require.NoError(t, model.DB.Model(&model.Batch{}).Where("id = ?", left.Id).Update("created_at", time.Now().Add(-time.Hour).Unix()).Error)
-	poll(t, left.BatchId)
+	held := poll(t, left.BatchId)
+	assert.Equal(t, model.BatchBillingHeld, held.BillingState, "the cancelled upstream batch may still bill what it ran")
+	resolve(t, left.BatchId, ResolveActionRefund, nil)
 	assert.Equal(t, startQuota, userQuota(t, testUser))
 	assert.Equal(t, startQuota, tokenRemain(t, testToken))
 	assert.Zero(t, usedQuota(t, testUser))
@@ -550,11 +554,13 @@ func TestLostSubmissionRefundsTheSubscriptionOnce(t *testing.T) {
 	require.NoError(t, model.DB.Create(sub).Error)
 	b := &model.Batch{BatchId: "batch_sub_lost", UserId: testUser, TokenId: testToken, ChannelId: 1, ChannelType: constant.ChannelTypeOpenRouter,
 		Status: model.BatchStatusValidating, Quota: 500, BillingState: model.BatchBillingReserved,
-		BillingSource: "subscription", SubscriptionId: 9, Model: testModel, CreatedAt: time.Now().Add(-time.Hour).Unix()}
+		BillingSource: "subscription", SubscriptionId: 9, Model: testModel, CreatedAt: time.Now().Add(-time.Hour).Unix(),
+		SubmissionUnrecorded: true}
 	require.NoError(t, model.CreateBatch(b))
 
-	poll(t, b.BatchId)
-	poll(t, b.BatchId)
+	assert.Equal(t, model.BatchBillingHeld, poll(t, b.BatchId).BillingState)
+	resolve(t, b.BatchId, ResolveActionRefund, nil)
+	resolveErr(t, b.BatchId, ResolveActionRefund)
 	var reloaded model.UserSubscription
 	require.NoError(t, model.DB.First(&reloaded, 9).Error)
 	assert.Equal(t, int64(1000), reloaded.AmountUsed)
@@ -566,7 +572,7 @@ func TestLostSubmissionRefundsTheSubscriptionOnce(t *testing.T) {
 // Poller
 // ---------------------------------------------------------------------------
 
-func TestBatchWithoutUpstreamExpiryIsGivenUpAfterItsWindow(t *testing.T) {
+func TestBatchWithoutUpstreamExpiryIsHeldAfterItsWindow(t *testing.T) {
 	resetDB(t)
 	upstream := newFakeUpstream(t)
 	seedBatchChannel(t, 1, constant.ChannelTypeOpenRouter, upstream.server.URL)
@@ -584,11 +590,17 @@ func TestBatchWithoutUpstreamExpiryIsGivenUpAfterItsWindow(t *testing.T) {
 
 	old := time.Now().Add(-(completionWindowDuration + upstreamLostAfter + time.Hour)).Unix()
 	require.NoError(t, model.DB.Model(&model.Batch{}).Where("batch_id = ?", b.BatchId).Update("created_at", old).Error)
-	given := poll(t, b.BatchId)
-	assert.Equal(t, model.BatchStatusFailed, given.Status)
-	assert.Equal(t, model.BatchBillingSettled, given.BillingState)
-	assert.Contains(t, given.Errors, "upstream_unreachable")
+	held := poll(t, b.BatchId)
+	assert.Equal(t, model.BatchBillingHeld, held.BillingState)
+	assert.Contains(t, held.Errors, "channel_unavailable")
 	assert.Equal(t, startQuota-b.Quota, userQuota(t, testUser), "the upstream may have billed it")
+
+	charged := resolve(t, b.BatchId, ResolveActionCharge, common.GetPointer(30))
+	assert.Equal(t, model.BatchStatusFailed, charged.Status)
+	assert.Equal(t, 30, charged.Quota)
+	assert.Equal(t, startQuota-30, userQuota(t, testUser), "the administrator charges what the upstream billed")
+	assert.Equal(t, startQuota-30, tokenRemain(t, testToken))
+	assert.Equal(t, 30, usedQuota(t, testUser))
 }
 
 func TestUpstreamNotFoundRecoversWhenTheBatchReappears(t *testing.T) {

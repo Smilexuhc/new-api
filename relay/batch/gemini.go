@@ -3,8 +3,10 @@ package batch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -135,6 +137,9 @@ func (a *geminiAdaptor) Submit(ctx context.Context, conn *Connection, req *Submi
 	}
 	batch, err := parseGeminiOperation(data)
 	if err != nil {
+		if errors.Is(err, errGeminiNoName) {
+			return nil, ErrNoUpstreamId
+		}
 		return nil, err
 	}
 	batch.ExpiresAt = time.Now().Add(geminiBatchLifetime).Unix()
@@ -149,11 +154,16 @@ func (a *geminiAdaptor) Retrieve(ctx context.Context, conn *Connection, upstream
 	return parseGeminiOperation(data)
 }
 
+// Cancel requests the cancellation; once the upstream accepted it, a failed
+// read of the new state does not undo it.
 func (a *geminiAdaptor) Cancel(ctx context.Context, conn *Connection, upstreamId string) (*UpstreamBatch, error) {
 	if _, err := doUpstream(ctx, conn, http.MethodPost, a.apiURL(conn, upstreamId+":cancel"), a.headers(conn), []byte("{}")); err != nil {
 		return nil, err
 	}
-	return a.Retrieve(ctx, conn, upstreamId)
+	if batch, err := a.Retrieve(ctx, conn, upstreamId); err == nil {
+		return batch, nil
+	}
+	return &UpstreamBatch{Id: upstreamId, Status: "cancelling"}, nil
 }
 
 func (a *geminiAdaptor) Delete(ctx context.Context, conn *Connection, upstreamId string) error {
@@ -161,8 +171,12 @@ func (a *geminiAdaptor) Delete(ctx context.Context, conn *Connection, upstreamId
 	return err
 }
 
+// geminiStatus maps a batch state; an unknown state maps to "", which keeps
+// the batch's current status.
 func geminiStatus(state string) string {
 	switch state {
+	case "BATCH_STATE_PENDING", "BATCH_STATE_UNSPECIFIED", "":
+		return "validating"
 	case "BATCH_STATE_RUNNING":
 		return "in_progress"
 	case "BATCH_STATE_SUCCEEDED":
@@ -174,9 +188,11 @@ func geminiStatus(state string) string {
 	case "BATCH_STATE_EXPIRED":
 		return "expired"
 	default:
-		return "validating"
+		return ""
 	}
 }
+
+var errGeminiNoName = errors.New("gemini batch response has no name")
 
 func parseGeminiOperation(data []byte) (*UpstreamBatch, error) {
 	var op geminiOperation
@@ -184,14 +200,14 @@ func parseGeminiOperation(data []byte) (*UpstreamBatch, error) {
 		return nil, err
 	}
 	if op.Name == "" {
-		return nil, fmt.Errorf("gemini batch response has no name")
+		return nil, errGeminiNoName
 	}
 	batch := &UpstreamBatch{Id: op.Name, Status: geminiStatus(op.Metadata.State)}
 	batch.Total, _ = strconv.Atoi(op.Metadata.BatchStats.RequestCount)
 	batch.Completed, _ = strconv.Atoi(op.Metadata.BatchStats.SuccessfulRequestCount)
 	batch.Failed, _ = strconv.Atoi(op.Metadata.BatchStats.FailedRequestCount)
 	if op.Error != nil {
-		batch.ErrorMessage = op.Error.Message
+		batch.ErrorMessage = cleanMessage(op.Error.Message)
 	}
 	output := op.Response
 	if output == nil {
@@ -221,7 +237,7 @@ func convertGeminiResult(index int, item geminiInlinedResponse) UpstreamResult {
 	if item.Error != nil {
 		result.StatusCode = geminiErrorStatus(item.Error.Code)
 		result.ErrorCode = strconv.Itoa(item.Error.Code)
-		result.ErrorMessage = item.Error.Message
+		result.ErrorMessage = cleanMessage(item.Error.Message)
 		if result.ErrorMessage == "" {
 			result.ErrorMessage = "request failed"
 		}
@@ -241,6 +257,7 @@ func convertGeminiResult(index int, item geminiInlinedResponse) UpstreamResult {
 	result.StatusCode = http.StatusOK
 	result.RequestId = extra.ResponseId
 	result.Model = extra.ModelVersion
+	result.GroundingQueries, result.FunctionCalls = geminiToolUsage(&response)
 	if response.HasUsageMetadata {
 		result.Usage = relayconvert.UsageFromGeminiMetadata(&response.UsageMetadata, 0)
 	}
@@ -260,12 +277,43 @@ func convertGeminiResult(index int, item geminiInlinedResponse) UpstreamResult {
 	return result
 }
 
+// geminiToolUsage counts what the synchronous Gemini relay bills as tool
+// calls: the distinct web and image search queries of grounded candidates,
+// and the function calls that do not continue.
+func geminiToolUsage(response *dto.GeminiChatResponse) (int, []string) {
+	queries := make(map[string]struct{})
+	var functions []string
+	for _, candidate := range response.Candidates {
+		if metadata := candidate.GroundingMetadata; metadata != nil {
+			for _, query := range slices.Concat(metadata.WebSearchQueries, metadata.ImageSearchQueries) {
+				if query = strings.TrimSpace(query); query != "" {
+					queries[query] = struct{}{}
+				}
+			}
+		}
+		for _, part := range candidate.Content.Parts {
+			call := part.FunctionCall
+			if call == nil || (call.WillContinue != nil && *call.WillContinue) {
+				continue
+			}
+			functions = append(functions, call.FunctionName)
+		}
+	}
+	return len(queries), functions
+}
+
 // geminiErrorStatus maps a google.rpc.Code to the HTTP status Google uses for
 // it.
 func geminiErrorStatus(code int) int {
 	switch code {
+	case 1:
+		return 499
 	case 3, 9, 11:
 		return http.StatusBadRequest
+	case 6, 10:
+		return http.StatusConflict
+	case 12:
+		return http.StatusNotImplemented
 	case 4:
 		return http.StatusGatewayTimeout
 	case 5:
