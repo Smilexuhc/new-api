@@ -326,6 +326,41 @@ func TestCancelledBatchTheUpstreamCompletedEndsCancelled(t *testing.T) {
 	assert.Equal(t, startQuota-got.Quota, userQuota(t, testUser))
 }
 
+func TestCancelOfABatchTheUpstreamFinishedIsRefused(t *testing.T) {
+	resetDB(t)
+	upstream := newFakeUpstream(t)
+	seedBatchChannel(t, 1, constant.ChannelTypeGemini, upstream.server.URL)
+	b, apiErr := create(t, upload(t, testUser, chatLine("a", "x", 10)).FileId)
+	require.Nil(t, apiErr)
+	upstream.set(geminiSucceeded)
+	c, _ := requestContext(testUser, testToken, testTokenKey, http.MethodPost, "/v1/batches/x/cancel")
+	_, cerr := CancelBatch(c, b.BatchId)
+	require.NotNil(t, cerr)
+	assert.Equal(t, http.StatusConflict, cerr.Status)
+	assert.Zero(t, upstream.cancels, "a finished batch is not cancelled upstream")
+
+	got := poll(t, b.BatchId)
+	assert.Equal(t, model.BatchStatusCompleted, got.Status)
+	assert.Equal(t, model.BatchBillingSettled, got.BillingState)
+}
+
+func TestGeminiCancelledWithSucceededRequestsButNoResultsIsHeld(t *testing.T) {
+	resetDB(t)
+	upstream := newFakeUpstream(t)
+	seedBatchChannel(t, 1, constant.ChannelTypeGemini, upstream.server.URL)
+	b, apiErr := create(t, upload(t, testUser, chatLine("a", "x", 10), chatLine("b", "y", 10)).FileId)
+	require.Nil(t, apiErr)
+	upstream.set(`{"name":"batches/g1","done":true,"metadata":{"state":"BATCH_STATE_CANCELLED","batchStats":{"requestCount":"2","successfulRequestCount":"2"}}}`)
+	held := poll(t, b.BatchId)
+	assert.Equal(t, model.BatchBillingHeld, held.BillingState)
+	assert.Contains(t, held.Errors, "upstream_results_lost")
+	assert.Equal(t, startQuota-b.Quota, userQuota(t, testUser), "the reservation is kept, not refunded")
+
+	upstream.set(`{"name":"batches/g1","done":true,"metadata":{"state":"BATCH_STATE_CANCELLED","batchStats":{"requestCount":"2"}}}`)
+	refunded := poll(t, b.BatchId)
+	assert.Equal(t, model.BatchBillingHeld, refunded.BillingState, "a held batch is not polled")
+}
+
 func TestLostChannelKeyHoldsAndResumeSettles(t *testing.T) {
 	resetDB(t)
 	upstream := newFakeUpstream(t)

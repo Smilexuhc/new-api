@@ -66,9 +66,11 @@ const (
 	settleFailuresBeforeHold = 6
 	// retrieveTimeout bounds one read of an upstream batch, results included.
 	retrieveTimeout = 5 * time.Minute
-	pollWorkers     = 8
-	maxPollBackoff  = 30 * time.Minute
-	pollBatchSize   = 100
+	// cancelCheckTimeout bounds the upstream read before a cancellation.
+	cancelCheckTimeout = 30 * time.Second
+	pollWorkers        = 8
+	maxPollBackoff     = 30 * time.Minute
+	pollBatchSize      = 100
 	// maxRemoteMediaPerBatch bounds the media a batch makes the gateway
 	// download.
 	maxRemoteMediaPerBatch = 1000
@@ -815,6 +817,10 @@ func refreshBatch(ctx context.Context, b *model.Batch, now int64) {
 		}
 		return
 	}
+	if upstream.ResultsLost {
+		hold(ctx, b, "upstream_results_lost", "the upstream finished requests of the batch but returned no results")
+		return
+	}
 	if isTerminalStatus(upstream.Status) && upstream.ResultsReady {
 		finalize(ctx, b, upstream)
 		return
@@ -1098,6 +1104,14 @@ func CancelBatch(c *gin.Context, batchId string) (*model.Batch, *Error) {
 	conn, adaptor, err := resolveConnection(b)
 	if err != nil {
 		return nil, internalError(err)
+	}
+	// Cancelling a batch the upstream just finished can drop its results.
+	retrieveCtx, cancelRetrieve := context.WithTimeout(c.Request.Context(), cancelCheckTimeout)
+	upstream, err := adaptor.Retrieve(retrieveCtx, conn, b.UpstreamBatchId)
+	cancelRetrieve()
+	if err == nil && isTerminalStatus(upstream.Status) {
+		_, _ = model.UpdateBatchIfStatus(b.BatchId, b.Status, map[string]any{"next_poll_at": common.GetTimestamp()})
+		return nil, newError(http.StatusConflict, "invalid_request_error", i18n.MsgBatchCannotCancel, map[string]any{"Status": upstream.Status})
 	}
 	if _, err := adaptor.Cancel(c.Request.Context(), conn, b.UpstreamBatchId); err != nil {
 		if errors.Is(err, ErrCancelNotSupported) {

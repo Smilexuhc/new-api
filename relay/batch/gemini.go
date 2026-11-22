@@ -227,8 +227,16 @@ func parseGeminiOperation(data []byte) (*UpstreamBatch, error) {
 		return batch, nil
 	}
 	// A succeeded batch always carries output; until it shows up the results
-	// are not ready. Failed, cancelled and expired batches may have none.
-	batch.ResultsReady = op.Done && batch.Status != "completed"
+	// are not ready. Failed, cancelled and expired batches may have none, but
+	// one cancelled just as it finished reports succeeded requests and drops
+	// their results.
+	if op.Done && batch.Status != "completed" {
+		if batch.Completed > 0 {
+			batch.ResultsLost = true
+		} else {
+			batch.ResultsReady = true
+		}
+	}
 	return batch, nil
 }
 

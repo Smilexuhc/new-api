@@ -55,7 +55,10 @@ type UpstreamBatch struct {
 	// ResultsReady is true once Results holds every result the upstream will
 	// return. Only terminal batches have results.
 	ResultsReady bool
-	Results      []UpstreamResult
+	// ResultsLost is true when the upstream finished the batch, reports
+	// succeeded requests and will never return their results.
+	ResultsLost bool
+	Results     []UpstreamResult
 	// Cost is the upstream charge in USD when the upstream reports one.
 	Cost         *float64
 	ErrorMessage string
