@@ -8,6 +8,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestResolveGeminiDefaultUsesDocumentedLevel(t *testing.T) {
+	t.Parallel()
+
+	for model, want := range map[string]Effort{
+		"gemini-4-carbon":       EffortMedium,
+		"gemini-4-argon":        EffortMedium,
+		"gemini-4-neon":         EffortHigh,
+		"gemini-4-hydrogen":     EffortHigh,
+		"gemini-3.8-flash":      EffortMedium,
+		"gemini-3.1-flash-lite": EffortMinimal,
+	} {
+		intent := ResolveGeminiDefault(model, Intent{})
+		assert.Equal(t, ModeEnabled, intent.Mode, model)
+		assert.Equal(t, want, intent.Effort, model)
+	}
+}
+
 func TestRenderGeminiMapsAndClampsInsteadOfRejecting(t *testing.T) {
 	t.Parallel()
 
@@ -95,6 +112,30 @@ func TestRenderGeminiMapsAndClampsInsteadOfRejecting(t *testing.T) {
 			wantLevel:  "high",
 			wantEffort: EffortHigh,
 			wantCodes:  []string{"gemini_level_adjusted"},
+		},
+		{
+			name:       "minimal on gemini 3.8 flash moves to low",
+			model:      "gemini-3.8-flash",
+			intent:     Intent{Mode: ModeEnabled, Effort: EffortMinimal},
+			wantLevel:  "low",
+			wantEffort: EffortLow,
+			wantCodes:  []string{"gemini_level_adjusted"},
+		},
+		{
+			name:       "xhigh on gemini 3.8 flash moves to high",
+			model:      "gemini-3.8-flash",
+			intent:     Intent{Mode: ModeEnabled, Effort: EffortXHigh},
+			wantLevel:  "high",
+			wantEffort: EffortHigh,
+			wantCodes:  []string{"gemini_level_adjusted"},
+		},
+		{
+			name:       "none on gemini 3.8 flash uses low",
+			model:      "gemini-3.8-flash",
+			intent:     Intent{Mode: ModeDisabled, Effort: EffortNone},
+			wantLevel:  "low",
+			wantEffort: EffortLow,
+			wantCodes:  []string{"gemini_thinking_disable_unsupported"},
 		},
 		{
 			name:       "effort on gemini 2.5 flash becomes budget",
@@ -295,6 +336,29 @@ func TestNormalizeGeminiThinkingConfigRewritesNativeConfig(t *testing.T) {
 			wantLevel:  "xhigh",
 			wantEffort: EffortXHigh,
 			wantCodes:  []string{"gemini_level_adjusted"},
+		},
+		{
+			name:       "minimal on gemini 3.8 flash moves to low",
+			model:      "gemini-3.8-flash",
+			config:     dto.GeminiThinkingConfig{ThinkingLevel: "minimal"},
+			wantLevel:  "low",
+			wantEffort: EffortLow,
+			wantCodes:  []string{"gemini_level_adjusted"},
+		},
+		{
+			name:       "zero budget on gemini 3.8 flash uses low",
+			model:      "gemini-3.8-flash",
+			config:     dto.GeminiThinkingConfig{ThinkingBudget: intPtr(0)},
+			wantLevel:  "low",
+			wantEffort: EffortLow,
+			wantCodes:  []string{"gemini_thinking_disable_unsupported"},
+		},
+		{
+			name:       "minimal on gemini 3.1 flash lite is kept",
+			model:      "gemini-3.1-flash-lite",
+			config:     dto.GeminiThinkingConfig{ThinkingLevel: "minimal"},
+			wantLevel:  "minimal",
+			wantEffort: EffortMinimal,
 		},
 		{
 			name:    "unknown level is rejected",

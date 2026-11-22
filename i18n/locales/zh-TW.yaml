@@ -115,7 +115,6 @@ batch.unsupported_endpoint: "batch 不支援介面 {{.Endpoint}}，目前只支�
 batch.invalid_completion_window: "completion_window 必須為 24h"
 batch.invalid_metadata: "metadata 最多 16 對，鍵不超過 64 個字元，值不超過 512 個字元"
 batch.no_channel: "分組 {{.Group}} 下沒有支援原生 Batch 的管道可服務模型 {{.Model}}"
-batch.tiered_billing_unsupported: "模型 {{.Model}} 使用階梯表達式計費，batch 暫不支援"
 batch.inline_too_large: "batch 超過 Gemini 內聯請求 {{.MaxMB}} MB 上限，請拆成更小的 batch"
 batch.upstream_error: "上游 Batch 介面回傳錯誤：{{.Message}}"
 batch.not_found: "batch 不存在"

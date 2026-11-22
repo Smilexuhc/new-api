@@ -103,8 +103,14 @@ func resultLine(customId string, result *UpstreamResult) outputLine {
 func buildSettlement(b *model.Batch, snapshot *billingSnapshot, lines []*inputLine, upstream *UpstreamBatch) *settlementResult {
 	c := &gin.Context{}
 	info := snapshot.relayInfo()
-	estimates, _, _ := estimateCharges(c, snapshot, lines)
 	fallbackEstimate := b.Quota / max(b.RequestTotal, 1)
+	estimates, _, _, err := estimateCharges(c, snapshot, lines)
+	if err != nil {
+		estimates = make([]int, len(lines))
+		for index := range estimates {
+			estimates[index] = fallbackEstimate
+		}
+	}
 
 	results := make(map[string]*UpstreamResult, len(upstream.Results))
 	order := make([]string, 0, len(upstream.Results))
@@ -130,7 +136,7 @@ func buildSettlement(b *model.Batch, snapshot *billingSnapshot, lines []*inputLi
 	var itemCost float64
 	hasItemCost := false
 
-	account := func(customId string, result *UpstreamResult, estimate int) {
+	account := func(customId string, input *inputLine, result *UpstreamResult, estimate int) {
 		line := resultLine(customId, result)
 		if !result.Succeeded() {
 			summary.Failed++
@@ -138,7 +144,7 @@ func buildSettlement(b *model.Batch, snapshot *billingSnapshot, lines []*inputLi
 			return
 		}
 		summary.Succeeded++
-		charge := chargeResult(c, info, result, estimate)
+		charge := chargeResult(c, info, input, result, estimate)
 		summary.Quota += charge.Quota
 		if charge.Estimated {
 			summary.EstimatedItems++
@@ -172,12 +178,12 @@ func buildSettlement(b *model.Batch, snapshot *billingSnapshot, lines []*inputLi
 			continue
 		}
 		delete(results, line.CustomId)
-		account(line.CustomId, result, estimates[index])
+		account(line.CustomId, line, result, estimates[index])
 	}
 	// Results the input does not list still cost what the upstream billed.
 	for _, customId := range order {
 		if result, ok := results[customId]; ok {
-			account(customId, result, fallbackEstimate)
+			account(customId, nil, result, fallbackEstimate)
 		}
 	}
 

@@ -6,6 +6,8 @@ var ModelList = []string{
 	"gemini-2.0-flash-001", "gemini-2.0-flash-lite-001", "gemini-2.0-flash-lite",
 	"gemini-2.5-flash-lite",
 	"gemini-3-pro-image", "gemini-3.1-flash-image",
+	"gemini-4-carbon", "gemini-4-argon", "gemini-4-neon", "gemini-4-hydrogen",
+	"gemini-3.8-flash", "gemini-3.1-flash-lite",
 	// latest version
 	"gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest",
 	"gemini-2.5-flash-native-audio-latest",

@@ -1,6 +1,10 @@
 package billing_setting
 
-import "github.com/QuantumNous/new-api/constant"
+import (
+	"time"
+
+	"github.com/QuantumNous/new-api/constant"
+)
 
 // deepSeekPeak is DeepSeek's peak window: Monday to Friday, 09:00-12:00 and
 // 14:00-18:00 Beijing time. The Chinese public holidays DeepSeek bills
@@ -36,4 +40,72 @@ var builtinBillingExpr = map[string]string{
 	// requests each, the same pricing page. The calls carry no tokens.
 	constant.DeepSeekSearchModel: `tier("request", fixed(0.00075))`,
 	constant.DeepSeekFetchModel:  `tier("request", fixed(0.00075))`,
+	// https://ai.google.dev/gemini-api/docs/pricing (Standard, 2026-11-22).
+	// Output prices include thinking tokens, which Gemini usage already counts
+	// as completion. Audio input costs the text price unless listed. Cached
+	// audio of 3.1 Flash-Lite ($0.05) bills at the text cache price, since cr
+	// does not split by modality.
+	"gemini-4-neon":         `tier("standard", p * 3 + cr * 0.15 + c * 15)`,
+	"gemini-4-hydrogen":     `tier("standard", p * 1.5 + cr * 0.075 + c * 7.5)`,
+	"gemini-3.1-flash-lite": `tier("standard", p * 0.25 + ai * 0.5 + cr * 0.025 + c * 1.5)`,
+}
+
+// scheduledBillingExpr is a built-in price that takes effect at From.
+type scheduledBillingExpr struct {
+	From time.Time
+	Expr string
+}
+
+// Google publishes price changes by calendar date without a time zone; they
+// take effect here at midnight Pacific time.
+var (
+	gemini4PriceChange    = time.Date(2026, time.December, 1, 8, 0, 0, 0, time.UTC)
+	gemini38PriceChange   = time.Date(2027, time.January, 1, 8, 0, 0, 0, time.UTC)
+	gemini4CarbonSchedule = []scheduledBillingExpr{
+		{Expr: `tier("standard", p * 2 + cr * 0.1 + c * 10)`},
+		{From: gemini4PriceChange, Expr: `tier("standard", p * 4 + cr * 0.2 + c * 20)`},
+	}
+)
+
+// builtinBillingSchedule holds built-in prices with a published change date,
+// oldest first; the first entry has no start. A model listed here must not
+// also be in builtinBillingExpr. Same source as the Gemini prices above.
+var builtinBillingSchedule = map[string][]scheduledBillingExpr{
+	"gemini-4-carbon": gemini4CarbonSchedule,
+	"gemini-4-argon":  gemini4CarbonSchedule,
+	"gemini-3.8-flash": {
+		{Expr: `tier("standard", p * 0.75 + cr * 0.075 + c * 3.75)`},
+		{From: gemini38PriceChange, Expr: `tier("standard", p * 1.5 + cr * 0.15 + c * 7.5)`},
+	},
+}
+
+// builtinBillingExprAt returns the built-in expression of model in effect at
+// now. A request freezes the expression in its billing snapshot, so a price
+// change does not reprice requests already reserved.
+func builtinBillingExprAt(model string, now time.Time) (string, bool) {
+	if expr, ok := builtinBillingExpr[model]; ok {
+		return expr, true
+	}
+	entries, ok := builtinBillingSchedule[model]
+	if !ok || len(entries) == 0 {
+		return "", false
+	}
+	expr := entries[0].Expr
+	for _, entry := range entries[1:] {
+		if !now.Before(entry.From) {
+			expr = entry.Expr
+		}
+	}
+	return expr, true
+}
+
+func builtinBillingModels() []string {
+	models := make([]string, 0, len(builtinBillingExpr)+len(builtinBillingSchedule))
+	for model := range builtinBillingExpr {
+		models = append(models, model)
+	}
+	for model := range builtinBillingSchedule {
+		models = append(models, model)
+	}
+	return models
 }

@@ -17,12 +17,12 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -260,10 +260,9 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 	if err := helper.ModelMappedHelper(c, info, nil); err != nil {
 		return nil, internalError(err)
 	}
-	billingModel := info.GetBillingModelName()
-	if billing_setting.GetBillingMode(billingModel) == billing_setting.BillingModeTieredExpr {
-		return nil, newError(http.StatusBadRequest, "invalid_request_error", i18n.MsgBatchTieredBillingUnsupported, map[string]any{"Model": modelName})
-	}
+	// An expression reads request parameters; the create call carries none,
+	// so the price check runs on the first request instead.
+	info.BillingRequestInput = &billingexpr.RequestInput{Body: lines[0].RawBody}
 	priceData, err := helper.ModelPriceHelper(c, info, 0, &types.TokenCountMeta{})
 	if err != nil {
 		return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}
@@ -272,6 +271,7 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 	ratio, ratioSource := batchRatioFor(adaptor)
 	snapshot := &billingSnapshot{
 		PriceData:              priceData,
+		Tiered:                 info.TieredBillingSnapshot,
 		BatchRatio:             ratio,
 		BatchRatioSource:       ratioSource,
 		OriginModel:            modelName,
@@ -300,7 +300,10 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		items = append(items, SubmitItem{CustomId: line.CustomId, Body: body})
 	}
 
-	_, preConsume, clamp := estimateCharges(c, snapshot, lines)
+	_, preConsume, clamp, err := estimateCharges(c, snapshot, lines)
+	if err != nil {
+		return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}
+	}
 	info.PriceData.AddOtherRatio(batchRatioKey, ratio)
 	info.ForcePreConsume = true
 	if apiErr := service.PreConsumeBilling(c, preConsume, info); apiErr != nil {
@@ -447,11 +450,15 @@ func recordSubmitLog(c *gin.Context, info *relaycommon.RelayInfo, b *model.Batch
 	other.SetPublic("batch_id", b.BatchId)
 	other.SetPublic("request_path", c.Request.URL.Path)
 	other.SetPublic("request_count", b.RequestTotal)
-	other.SetPublic("model_price", info.PriceData.ModelPrice)
-	if info.PriceData.ModelRatio > 0 {
-		other.SetPublic("model_ratio", info.PriceData.ModelRatio)
+	if info.TieredBillingSnapshot != nil {
+		noteTieredExpr(info.TieredBillingSnapshot, other)
+	} else {
+		other.SetPublic("model_price", info.PriceData.ModelPrice)
+		if info.PriceData.ModelRatio > 0 {
+			other.SetPublic("model_ratio", info.PriceData.ModelRatio)
+		}
+		other.SetPublic("completion_ratio", info.PriceData.CompletionRatio)
 	}
-	other.SetPublic("completion_ratio", info.PriceData.CompletionRatio)
 	other.SetPublic("group_ratio", info.PriceData.GroupRatioInfo.GroupRatio)
 	other.SetPublic(batchRatioKey, ratio)
 	other.SetAdmin("batch_ratio_source", ratioSource)
@@ -739,6 +746,7 @@ func finalize(ctx context.Context, b *model.Batch, upstream *UpstreamBatch) {
 	other.SetPublic("succeeded", summary.Succeeded)
 	other.SetPublic("failed", summary.Failed+summary.NotProcessed)
 	other.SetPublic(batchRatioKey, snapshot.BatchRatio)
+	noteTieredExpr(snapshot.Tiered, other)
 	if len(summary.ModelVersions) > 0 {
 		other.SetPublic("model_versions", summary.ModelVersions)
 	}

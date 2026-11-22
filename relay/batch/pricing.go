@@ -2,6 +2,8 @@ package batch
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -9,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -42,26 +45,30 @@ const (
 )
 
 // billingSnapshot freezes the price of a batch when it is created, so a price
-// change while the batch runs does not change its charge.
+// change while the batch runs does not change its charge. Tiered holds the
+// expression of a model billed by tiered_expr; PriceData then carries only the
+// group ratio.
 type billingSnapshot struct {
-	PriceData              hosttypes.PriceData `json:"price_data"`
-	BatchRatio             float64             `json:"batch_ratio"`
-	BatchRatioSource       string              `json:"batch_ratio_source"`
-	OriginModel            string              `json:"origin_model"`
-	BillingModel           string              `json:"billing_model"`
-	UpstreamModel          string              `json:"upstream_model"`
-	ChannelType            int                 `json:"channel_type"`
-	DefaultMaxOutputTokens int                 `json:"default_max_output_tokens"`
+	PriceData              hosttypes.PriceData          `json:"price_data"`
+	Tiered                 *billingexpr.BillingSnapshot `json:"tiered,omitempty"`
+	BatchRatio             float64                      `json:"batch_ratio"`
+	BatchRatioSource       string                       `json:"batch_ratio_source"`
+	OriginModel            string                       `json:"origin_model"`
+	BillingModel           string                       `json:"billing_model"`
+	UpstreamModel          string                       `json:"upstream_model"`
+	ChannelType            int                          `json:"channel_type"`
+	DefaultMaxOutputTokens int                          `json:"default_max_output_tokens"`
 }
 
 // relayInfo rebuilds what the text pricing reads from a request, with the
 // batch ratio as one of the other ratios so it scales every price component.
 func (s *billingSnapshot) relayInfo() *relaycommon.RelayInfo {
 	info := &relaycommon.RelayInfo{
-		OriginModelName:  s.OriginModel,
-		BillingModelName: s.BillingModel,
-		StartTime:        time.Now(),
-		RelayFormat:      types.RelayFormatOpenAI,
+		OriginModelName:       s.OriginModel,
+		BillingModelName:      s.BillingModel,
+		StartTime:             time.Now(),
+		RelayFormat:           types.RelayFormatOpenAI,
+		TieredBillingSnapshot: s.Tiered,
 		ChannelMeta: &relaycommon.ChannelMeta{
 			ChannelType:       s.ChannelType,
 			UpstreamModelName: s.UpstreamModel,
@@ -70,6 +77,16 @@ func (s *billingSnapshot) relayInfo() *relaycommon.RelayInfo {
 	info.PriceData = s.PriceData
 	info.PriceData.AddOtherRatio(batchRatioKey, s.BatchRatio)
 	return info
+}
+
+// priceItem prices one request of the batch. An expression reads request
+// parameters from the request's own body, not from the batch create call.
+func priceItem(c *gin.Context, info *relaycommon.RelayInfo, line *inputLine, usage *dto.Usage) (service.TextUsagePrice, error) {
+	info.BillingRequestInput = nil
+	if info.TieredBillingSnapshot != nil && line != nil {
+		info.BillingRequestInput = &billingexpr.RequestInput{Body: line.RawBody}
+	}
+	return service.PriceTextUsage(c, info, usage)
 }
 
 // estimateUsage is the most a request can use: its estimated input and its
@@ -117,15 +134,29 @@ type itemCharge struct {
 // estimateCharges prices every line at its estimated maximum usage. Each
 // charge saturates at the single-request bound, so the int64 total cannot wrap;
 // the clamp, if any, belongs in the submit log.
-func estimateCharges(c *gin.Context, snapshot *billingSnapshot, lines []*inputLine) ([]int, int, *common.QuotaClamp) {
+func estimateCharges(c *gin.Context, snapshot *billingSnapshot, lines []*inputLine) ([]int, int, *common.QuotaClamp, error) {
 	info := snapshot.relayInfo()
 	charges := make([]int, len(lines))
 	total := 0
 	for index, line := range lines {
-		charges[index] = service.PriceTextUsage(c, info, estimateUsage(line, snapshot.DefaultMaxOutputTokens)).Quota
+		price, err := priceItem(c, info, line, estimateUsage(line, snapshot.DefaultMaxOutputTokens))
+		if err != nil {
+			return nil, 0, nil, fmt.Errorf("request %s: %w", line.CustomId, err)
+		}
+		charges[index] = price.Quota
 		total += charges[index]
 	}
-	return charges, total, info.QuotaClamp
+	return charges, total, info.QuotaClamp, nil
+}
+
+// noteTieredExpr records the expression a batch is priced by, as the
+// synchronous consume log does.
+func noteTieredExpr(snap *billingexpr.BillingSnapshot, other *model.LogOther) {
+	if snap == nil {
+		return
+	}
+	other.SetPublic("billing_mode", "tiered_expr")
+	other.SetPublic("expr_b64", base64.StdEncoding.EncodeToString([]byte(snap.ExprString)))
 }
 
 // noteQuotaSaturation records a quota clamp on a batch log so the anomaly is
@@ -140,15 +171,20 @@ func noteQuotaSaturation(ctx context.Context, b *model.Batch, clamp *common.Quot
 }
 
 // chargeResult prices one result. Failed requests are free. A succeeded
-// request without usage is charged its estimate, since the upstream billed it
-// but did not say how much.
-func chargeResult(c *gin.Context, info *relaycommon.RelayInfo, result *UpstreamResult, estimate int) itemCharge {
+// request is charged its estimate when the upstream billed it without saying
+// how much, or when its usage cannot be priced. line is nil for a result the
+// input does not list.
+func chargeResult(c *gin.Context, info *relaycommon.RelayInfo, line *inputLine, result *UpstreamResult, estimate int) itemCharge {
 	if result == nil || !result.Succeeded() {
 		return itemCharge{}
 	}
 	if result.Usage == nil {
 		return itemCharge{Quota: estimate, Estimated: true}
 	}
-	price := service.PriceTextUsage(c, info, result.Usage)
+	price, err := priceItem(c, info, line, result.Usage)
+	if err != nil {
+		common.SysError(common.LogText("batch result %s: pricing failed, charging its estimate: %s", result.CustomId, err.Error()))
+		return itemCharge{Quota: estimate, Estimated: true}
+	}
 	return itemCharge{Quota: price.Quota, PromptTokens: price.PromptTokens, CompletionTokens: price.CompletionTokens}
 }

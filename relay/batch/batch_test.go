@@ -18,6 +18,8 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
@@ -772,6 +774,98 @@ func TestGeminiBatchFlowCancelAndModelVersion(t *testing.T) {
 	assert.Equal(t, model.BatchStatusCancelled, cancelled.Status)
 	assert.Zero(t, cancelled.Quota)
 	assert.Equal(t, before+running.Quota, userQuota(t, testUser), "a cancelled batch without results is refunded")
+}
+
+// geminiAudioResult is a Gemini batch result for an audio caption request:
+// audio and text input, thinking tokens and a model version.
+func geminiAudioResult(key string, text, audio, candidates, thoughts int) string {
+	return fmt.Sprintf(`{"response":{"candidates":[{"content":{"parts":[{"text":"caption"}],"role":"model"},"finishReason":"STOP","index":0}],
+ "usageMetadata":{"promptTokenCount":%d,"candidatesTokenCount":%d,"thoughtsTokenCount":%d,"totalTokenCount":%d,
+  "promptTokensDetails":[{"modality":"TEXT","tokenCount":%d},{"modality":"AUDIO","tokenCount":%d}]},
+ "modelVersion":"gemini-3.1-flash-lite-05-2026"},"metadata":{"key":%q}}`,
+		text+audio, candidates, thoughts, text+audio+candidates+thoughts, text, audio, key)
+}
+
+func tieredLine(customId string, modelName string, prompt string, maxTokens int) string {
+	return fmt.Sprintf(`{"custom_id":%q,"method":"POST","url":"/v1/chat/completions","body":{"model":%q,"messages":[{"role":"user","content":%q}],"max_tokens":%d}}`,
+		customId, modelName, prompt, maxTokens)
+}
+
+// TestGeminiBatchBillsBuiltinExpressionAtBatchRatio settles a batch of a model
+// priced by a built-in expression: audio tokens at the audio price, thinking
+// tokens as output, then the batch ratio on top.
+func TestGeminiBatchBillsBuiltinExpressionAtBatchRatio(t *testing.T) {
+	resetDB(t)
+	const modelName = "gemini-3.1-flash-lite"
+	upstream := newFakeUpstream(t)
+	seedBatchChannel(t, 1, constant.ChannelTypeGemini, upstream.server.URL)
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", 1).Update("models", modelName).Error)
+	model.InitChannelCache()
+
+	file := upload(t, testUser, tieredLine("a", modelName, "caption this", 50), tieredLine("b", modelName, "caption that", 80))
+	b, apiErr := create(t, file.FileId)
+	require.Nil(t, apiErr)
+
+	// $0.25 text, $0.50 audio and $1.50 output per 1M tokens; 1 quota is $0.000002.
+	price := func(text, audio, output int, ratio float64) int {
+		return int(math.Round((float64(text)*0.25 + float64(audio)*0.5 + float64(output)*1.5) / 1e6 * 500000 * ratio))
+	}
+	lines, _ := parseInput(file.Content, "", 100)
+	reserved := 0
+	for _, line := range lines {
+		usage := estimateUsage(line, 100)
+		reserved += price(usage.PromptTokens, 0, usage.CompletionTokens, 0.5)
+	}
+	assert.Equal(t, reserved, b.Quota)
+	submitLog := lastLog(t)
+	assert.Contains(t, submitLog.Other, `"billing_mode":"tiered_expr"`)
+	assert.NotContains(t, submitLog.Other, `"model_ratio"`)
+
+	upstream.set(`{"name":"batches/g1","done":true,"metadata":{"state":"BATCH_STATE_SUCCEEDED"},
+"response":{"inlinedResponses":{"inlinedResponses":[` + geminiAudioResult("b", 900, 4800, 401, 1100) + `,` + geminiAudioResult("a", 300, 1600, 120, 0) + `]}}}`)
+	settled := poll(t, b.BatchId)
+	require.Equal(t, model.BatchStatusCompleted, settled.Status)
+	want := price(300, 1600, 120, 0.5) + price(900, 4800, 401+1100, 0.5)
+	assert.Equal(t, want, settled.Quota)
+	assert.Equal(t, startQuota-want, userQuota(t, testUser))
+	assert.Equal(t, startQuota-want, tokenRemain(t, testToken))
+
+	view := NewBatchObject(settled)
+	require.NotNil(t, view.Usage)
+	assert.Equal(t, 6400, view.Usage.InputTokensDetails["audio_tokens"])
+	assert.Equal(t, 1100, view.Usage.OutputTokensDetails["reasoning_tokens"])
+	assert.Equal(t, map[string]int{"gemini-3.1-flash-lite-05-2026": 2}, view.Usage.ModelVersions)
+	settleLog := lastLog(t)
+	assert.Contains(t, settleLog.Other, `"billing_mode":"tiered_expr"`)
+}
+
+// TestBatchExpressionReadsEachRequestBody prices every request of a batch by
+// its own parameters, and keeps the expression frozen when the administrator
+// changes it while the batch runs.
+func TestBatchExpressionReadsEachRequestBody(t *testing.T) {
+	resetDB(t)
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	saved := *settings
+	t.Cleanup(func() { *settings = saved })
+	const modelName = "batch-expr-model"
+	settings.BillingMode = map[string]string{modelName: billing_setting.BillingModeTieredExpr}
+	settings.BillingExpr = map[string]string{modelName: `param("max_tokens") > 60 ? tier("long", p * 4 + c * 4) : tier("short", p * 2 + c * 2)`}
+
+	upstream := newFakeUpstream(t)
+	seedBatchChannel(t, 1, constant.ChannelTypeOpenRouter, upstream.server.URL)
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", 1).Update("models", modelName).Error)
+	model.InitChannelCache()
+
+	file := upload(t, testUser, tieredLine("a", modelName, "short", 50), tieredLine("b", modelName, "long", 80))
+	b, apiErr := create(t, file.FileId)
+	require.Nil(t, apiErr)
+
+	settings.BillingExpr[modelName] = `tier("changed", p * 100 + c * 100)`
+	upstream.set(openRouterTerminal("completed",
+		"["+orResult("a", 100, 10, "vendor/model-1", 0)+","+orResult("b", 100, 10, "vendor/model-1", 0)+"]", "0"))
+	settled := poll(t, b.BatchId)
+	// short: 110 tokens * $2, long: 110 tokens * $4, per 1M tokens, at half price.
+	assert.Equal(t, int(math.Round(110*2/1e6*500000*0.5))+int(math.Round(110*4/1e6*500000*0.5)), settled.Quota)
 }
 
 func TestBatchDeleteNeedsASettledBatch(t *testing.T) {

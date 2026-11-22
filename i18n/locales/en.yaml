@@ -114,7 +114,6 @@ batch.unsupported_endpoint: "Endpoint {{.Endpoint}} is not supported for batches
 batch.invalid_completion_window: "completion_window must be 24h"
 batch.invalid_metadata: "metadata allows at most 16 pairs, keys up to 64 and values up to 512 characters"
 batch.no_channel: "No channel with a native batch API serves model {{.Model}} under group {{.Group}}"
-batch.tiered_billing_unsupported: "Model {{.Model}} uses tiered expression billing, which batches do not support"
 batch.inline_too_large: "The batch exceeds the {{.MaxMB}} MB inline limit of the Gemini batch API; split it into smaller batches"
 batch.upstream_error: "The upstream batch API returned an error: {{.Message}}"
 batch.not_found: "Batch not found"
