@@ -74,6 +74,11 @@ var pluginHandoffRoutes = func() map[string]struct{} {
 		routes[route.method+" /v1/batches"+route.path] = struct{}{}
 		routes[route.method+" /v1/batches"+route.path+"/"] = struct{}{}
 	}
+	// files.retrieve overlaps plugin paths such as GET /v1/files/retrieve.
+	// Both slash forms are handoff routes so neither redirects and neither
+	// blocks the plugin.
+	routes[http.MethodGet+" /v1/files/:id"] = struct{}{}
+	routes[http.MethodGet+" /v1/files/:id/"] = struct{}{}
 	return routes
 }()
 

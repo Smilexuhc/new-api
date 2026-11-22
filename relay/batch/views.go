@@ -83,6 +83,16 @@ type ListObject[T any] struct {
 	HasMore bool    `json:"has_more"`
 }
 
+// batchViewStatus reports a held batch as held. The stored status stays
+// validating or in_progress so a resume continues from where the poll left
+// off; clients that only watch the public status would otherwise wait forever.
+func batchViewStatus(b *model.Batch) string {
+	if b.BillingState == model.BatchBillingHeld {
+		return model.BatchBillingHeld
+	}
+	return b.Status
+}
+
 func optionalTime(value int64) *int64 {
 	if value == 0 {
 		return nil
@@ -118,7 +128,7 @@ func NewBatchObject(b *model.Batch) BatchObject {
 		Model:            b.Model,
 		InputFileId:      b.InputFileId,
 		CompletionWindow: b.CompletionWindow,
-		Status:           b.Status,
+		Status:           batchViewStatus(b),
 		OutputFileId:     optionalString(b.OutputFileId),
 		ErrorFileId:      optionalString(b.ErrorFileId),
 		CreatedAt:        b.CreatedAt,

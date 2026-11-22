@@ -248,6 +248,46 @@ func SetRelayRouter(router *gin.Engine) {
 			controller.Relay(c, types.RelayFormatGemini)
 		})
 	}
+
+	// OpenAI files.retrieve. Offered to plugins first so GET /v1/files/retrieve
+	// still reaches the plugin that owns it. Disabled, an unknown file answers
+	// like an unregistered route, before authentication.
+	router.GET("/v1/files/:id", retrieveBatchFile)
+	router.GET("/v1/files/:id/", retrieveBatchFile)
+}
+
+// retrieveBatchFile serves GET /v1/files/:id. A plugin route at the same path
+// answers first. The writer is restored after a miss: the plugin attempt
+// swaps in a writer that drops a response when no plugin route matches.
+func retrieveBatchFile(c *gin.Context) {
+	writer := c.Writer
+	offerPluginRoute(c)
+	if c.IsAborted() {
+		return
+	}
+	c.Writer = writer
+	if !operation_setting.GetBatchSetting().Enabled {
+		controller.RelayNotFound(c)
+		return
+	}
+	for _, handler := range []gin.HandlerFunc{
+		middleware.RouteTag("relay"),
+		middleware.SystemPerformanceCheck(),
+		middleware.TokenAuth(),
+		middleware.ModelRequestRateLimit(),
+	} {
+		handler(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+	controller.RetrieveBatchFile(c)
+}
+
+// offerPluginRoute gives a handoff route to the active plugin generation.
+// Tests that build their own generation replace it for the duration of the test.
+var offerPluginRoute = func(c *gin.Context) {
+	defaultPluginDispatcher.dispatch(c)
 }
 
 func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {

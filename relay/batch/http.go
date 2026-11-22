@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -97,10 +98,21 @@ func upstreamErrorMessage(data []byte) string {
 	return string(data)
 }
 
+// maskedAddressPort is a port left on an address the shared masker already
+// starred, as in "***.***.***.***:3590", "***.com:8443" or "[***]:443".
+var maskedAddressPort = regexp.MustCompile(`(\*\*\*(?:\.\*\*\*)*(?:\.[A-Za-z]{2,24}){0,3}|\]):\d{2,5}\b`)
+
+// bareHostPattern is a hostname, with an optional port, that the shared masker
+// leaves alone because it is not the channel's base URL. The prefix is kept.
+var bareHostPattern = regexp.MustCompile(`(^|[^A-Za-z0-9.-])((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24})(?::\d{1,5})?\b`)
+
 // cleanMessage masks addresses and keys in an upstream message, as the
-// synchronous relay does, and bounds its length.
+// synchronous relay does, then also hides ports and hostnames that appear on
+// their own, and bounds its length.
 func cleanMessage(message string, upstreamURLs ...string) string {
 	message = common.MaskSensitiveInfo(strings.TrimSpace(message), upstreamURLs...)
+	message = bareHostPattern.ReplaceAllString(message, "${1}***")
+	message = maskedAddressPort.ReplaceAllString(message, "${1}:***")
 	if len(message) > maxMessageLength {
 		message = strings.ToValidUTF8(message[:maxMessageLength], "") + "..."
 	}

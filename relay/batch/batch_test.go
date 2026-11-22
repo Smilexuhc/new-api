@@ -1041,6 +1041,49 @@ func TestBatchPollBacksOffOnUpstreamErrors(t *testing.T) {
 	assert.Equal(t, model.BatchBillingReserved, refreshed.BillingState)
 }
 
+func TestCleanMessageMasksPortsAndBareHostnames(t *testing.T) {
+	got := cleanMessage(
+		`fault injected by proxy at http://10.0.0.1:3590/batch/secret/path (internal host gemini-edge-7.corp.local) dial tcp [2001:db8::1]:443 model gpt-4.1`,
+		"http://10.0.0.1:3590",
+	)
+	assert.NotContains(t, got, "3590")
+	assert.NotContains(t, got, "10.0.0.1")
+	assert.NotContains(t, got, "gemini-edge-7")
+	assert.NotContains(t, got, "corp.local")
+	assert.NotContains(t, got, "secret")
+	assert.Contains(t, got, "gpt-4.1")
+	assert.Contains(t, got, ":***")
+}
+
+func TestHeldBatchIsNotShownAsValidating(t *testing.T) {
+	held := NewBatchObject(&model.Batch{
+		BatchId: "batch_held", Status: model.BatchStatusValidating, BillingState: model.BatchBillingHeld,
+		Endpoint: "/v1/chat/completions",
+	})
+	assert.Equal(t, "held", held.Status)
+	running := NewBatchObject(&model.Batch{
+		Status: model.BatchStatusInProgress, BillingState: model.BatchBillingReserved,
+	})
+	assert.Equal(t, model.BatchStatusInProgress, running.Status)
+}
+
+func TestGetFileReturnsTheOpenAIFileObject(t *testing.T) {
+	resetDB(t)
+	stored := upload(t, testUser, chatLine("a", "x", 10))
+	file, apiErr := GetFile(testUser, stored.FileId)
+	require.Nil(t, apiErr)
+	object := NewFileObject(file)
+	assert.Equal(t, stored.FileId, object.Id)
+	assert.Equal(t, "file", object.Object)
+	assert.Equal(t, "processed", object.Status)
+	assert.Equal(t, stored.Bytes, object.Bytes)
+	assert.Equal(t, model.BatchFilePurposeInput, object.Purpose)
+	_, apiErr = GetFile(otherUser, stored.FileId)
+	assert.Equal(t, http.StatusNotFound, apiErr.Status)
+	_, apiErr = GetFile(testUser, "file-missing")
+	assert.Equal(t, http.StatusNotFound, apiErr.Status)
+}
+
 func TestBatchAndFileAccessIsPerUser(t *testing.T) {
 	resetDB(t)
 	upstream := newFakeUpstream(t)

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -136,6 +137,16 @@ func DownloadBatchFile(c *gin.Context) {
 	c.Data(http.StatusOK, "application/jsonl", file.Content)
 }
 
+// RetrieveBatchFile is OpenAI files.retrieve: the file object, without its bytes.
+func RetrieveBatchFile(c *gin.Context) {
+	file, apiErr := batch.GetFile(c.GetInt("id"), c.Param("id"))
+	if apiErr != nil {
+		writeBatchError(c, apiErr)
+		return
+	}
+	c.JSON(http.StatusOK, batch.NewFileObject(file))
+}
+
 func CreateBatch(c *gin.Context) {
 	var req batch.CreateRequest
 	if err := common.UnmarshalBodyReusable(c, &req); err != nil {
@@ -202,12 +213,14 @@ func AdminListHeldBatches(c *gin.Context) {
 func AdminResolveHeldBatch(c *gin.Context) {
 	var req batch.ResolveRequest
 	if err := common.UnmarshalBodyReusable(c, &req); err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusBadRequest, err)
 		return
 	}
 	resolved, apiErr := batch.ResolveHeldBatch(c, c.GetInt("id"), c.Param("id"), &req)
 	if apiErr != nil {
-		common.ApiErrorMsg(c, apiErr.Text(c))
+		// The console envelope stays {success, message}; the status is the one
+		// the service decided (409 already settled, 400 illegal action).
+		common.ApiErrorStatus(c, apiErr.Status, errors.New(apiErr.Text(c)))
 		return
 	}
 	common.ApiSuccess(c, resolved)

@@ -154,6 +154,15 @@ func UploadFile(userId int, tokenId int, purpose string, filename string, conten
 	return file, nil
 }
 
+// GetFile returns a user's file metadata. Another user's file is not found.
+func GetFile(userId int, fileId string) (*model.BatchFile, *Error) {
+	file, err := model.GetBatchFile(userId, fileId, false)
+	if err != nil {
+		return nil, notFoundOr(err, i18n.MsgBatchFileNotFound)
+	}
+	return file, nil
+}
+
 func GetFileContent(userId int, fileId string) (*model.BatchFile, *Error) {
 	file, err := model.GetBatchFile(userId, fileId, true)
 	if err != nil {

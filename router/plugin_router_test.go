@@ -540,6 +540,11 @@ func TestBuiltInPluginRoutesAreServedBesideHostRoutes(t *testing.T) {
 	))
 	require.NoError(t, registry.SetGenerationPreparer(builder.prepare))
 	outer.NoRoute((&pluginRouteDispatcher{registry: registry}).dispatch, controller.RelayNotFound)
+	// GET /v1/files/:id is a host route that offers the request to plugins
+	// before answering. Point that offer at this test's generation.
+	previousOffer := offerPluginRoute
+	offerPluginRoute = (&pluginRouteDispatcher{registry: registry}).dispatch
+	t.Cleanup(func() { offerPluginRoute = previousOffer })
 
 	require.Empty(t, registry.RoutingErrors())
 	require.Empty(t, registry.Generation().SkippedRoutes())
