@@ -148,8 +148,19 @@ func readMaxOutputTokens(body map[string]json.RawMessage) (int, error) {
 	return best, nil
 }
 
-// withModel returns the body with model replaced by the upstream model name.
-func (l *inputLine) withModel(upstreamModel string) ([]byte, error) {
+// outputLimit is the output limit the request is sent with: its own, or
+// defaultMaxOutput when it sets none.
+func (l *inputLine) outputLimit(defaultMaxOutput int) int {
+	if l.MaxOutputTokens > 0 {
+		return l.MaxOutputTokens
+	}
+	return defaultMaxOutput
+}
+
+// upstreamBody returns the body with model replaced by the upstream model
+// name. A request without an output limit gets defaultMaxOutput as max_tokens,
+// so its output, and with it its charge, stays within the reservation.
+func (l *inputLine) upstreamBody(upstreamModel string, defaultMaxOutput int) ([]byte, error) {
 	body := make(map[string]json.RawMessage, len(l.Body))
 	for key, value := range l.Body {
 		body[key] = value
@@ -159,5 +170,20 @@ func (l *inputLine) withModel(upstreamModel string) ([]byte, error) {
 		return nil, err
 	}
 	body["model"] = modelValue
+	// A zero limit means none upstream, and the Gemini converter prefers a
+	// zero max_completion_tokens over a set max_tokens.
+	for _, field := range []string{"max_completion_tokens", "max_tokens"} {
+		var value float64
+		if raw, ok := body[field]; ok && (string(raw) == "null" || (common.Unmarshal(raw, &value) == nil && value == 0)) {
+			delete(body, field)
+		}
+	}
+	if l.MaxOutputTokens <= 0 && defaultMaxOutput > 0 {
+		limit, err := common.Marshal(defaultMaxOutput)
+		if err != nil {
+			return nil, err
+		}
+		body["max_tokens"] = limit
+	}
 	return common.Marshal(body)
 }

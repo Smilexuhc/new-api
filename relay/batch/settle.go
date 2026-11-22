@@ -104,7 +104,7 @@ func buildSettlement(b *model.Batch, snapshot *billingSnapshot, lines []*inputLi
 	c := &gin.Context{}
 	info := snapshot.relayInfo()
 	fallbackEstimate := b.Quota / max(b.RequestTotal, 1)
-	estimates, _, _, err := estimateCharges(c, snapshot, lines)
+	estimates, _, _, err := estimateCharges(c, snapshot, lines, nil)
 	if err != nil {
 		estimates = make([]int, len(lines))
 		for index := range estimates {

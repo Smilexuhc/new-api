@@ -27,6 +27,21 @@ type BatchSettlement struct {
 	Other            *model.LogOther
 }
 
+// ReleaseBatchReservation returns the whole reservation of a batch that never
+// reached the upstream. Such a batch was neither logged nor counted in used
+// quota, so only the funding source and the token get the quota back. The
+// caller guarantees it runs at most once per batch.
+func ReleaseBatchReservation(ctx context.Context, s BatchSettlement) error {
+	if s.PreConsumed <= 0 {
+		return nil
+	}
+	if err := AdjustAsyncFunding(s.UserId, s.BillingSource, s.SubscriptionId, -s.PreConsumed); err != nil {
+		return err
+	}
+	AdjustAsyncTokenQuota(ctx, s.TokenId, s.BatchId, -s.PreConsumed)
+	return nil
+}
+
 // SettleBatchCharge charges or refunds the difference between the actual
 // and the reserved quota of a batch, on the funding source and token used at
 // submission, and records it in the user log. The caller guarantees it runs

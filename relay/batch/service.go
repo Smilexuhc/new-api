@@ -38,11 +38,22 @@ const (
 	// submitGracePeriod is how long a batch may stay without an upstream id
 	// before the poller treats its submission as lost.
 	submitGracePeriod = 10 * time.Minute
+	// submitTimeout bounds the upload of a batch to the upstream.
+	submitTimeout        = 5 * time.Minute
+	submitSaveAttempts   = 3
+	submitSaveRetryDelay = 200 * time.Millisecond
+	// completionWindowDuration stands in for the expiry of an upstream batch
+	// that reports none.
+	completionWindowDuration = 24 * time.Hour
 	// upstreamLostAfter is how long past its expiry an unfinished batch keeps
 	// being polled before it is given up.
 	upstreamLostAfter = 7 * 24 * time.Hour
-	maxPollBackoff    = 30 * time.Minute
-	pollBatchSize     = 100
+	// notFoundPollsBeforeGiveUp is how many polls in a row must fail, the last
+	// with not found, before a batch is treated as gone upstream; a single
+	// not found can come from a proxy or a changed base URL.
+	notFoundPollsBeforeGiveUp = 4
+	maxPollBackoff            = 30 * time.Minute
+	pollBatchSize             = 100
 )
 
 func keyFingerprint(key string) string {
@@ -282,9 +293,11 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 	}
 
 	items := make([]SubmitItem, 0, len(lines))
+	bodies := make([][]byte, 0, len(lines))
 	converter, converts := adaptor.(RequestConverter)
+	inlineBytes := 0
 	for _, line := range lines {
-		body, err := line.withModel(info.UpstreamModelName)
+		body, err := line.upstreamBody(info.UpstreamModelName, setting.DefaultMaxOutputTokens)
 		if err != nil {
 			return nil, lineError(line.Line, err.Error())
 		}
@@ -293,14 +306,20 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 			if err := common.Unmarshal(body, &request); err != nil {
 				return nil, lineError(line.Line, err.Error())
 			}
+			// Conversion downloads linked media; stop once the batch cannot
+			// fit the inline limit instead of downloading the rest.
 			if body, err = converter.ConvertRequest(c, info, &request); err != nil {
 				return nil, lineError(line.Line, err.Error())
 			}
+			if inlineBytes += len(body); inlineBytes > GeminiInlineRequestLimit {
+				return nil, submitError(ErrGeminiInlineTooLarge)
+			}
 		}
 		items = append(items, SubmitItem{CustomId: line.CustomId, Body: body})
+		bodies = append(bodies, body)
 	}
 
-	_, preConsume, clamp, err := estimateCharges(c, snapshot, lines)
+	_, preConsume, clamp, err := estimateCharges(c, snapshot, lines, bodies)
 	if err != nil {
 		return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}
 	}
@@ -363,6 +382,11 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		refund()
 		return nil, internalError(err)
 	}
+	// From here the record owns the reservation: every refund goes through
+	// its reserved-to-settled switch, so a refund cannot happen twice.
+	if err := service.SettleBilling(c, info, preConsume); err != nil {
+		logger.LogError(c, common.LogText("batch %s: failed to confirm the reservation: %s", batchId, err.Error()))
+	}
 
 	conn := &Connection{
 		ChannelType: channel.Type,
@@ -370,7 +394,11 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		Key:         key,
 		Proxy:       channel.GetSetting().Proxy,
 	}
-	upstream, err := adaptor.Submit(c.Request.Context(), conn, &SubmitRequest{
+	// A client that goes away must not abort a submission the upstream may
+	// already have accepted.
+	submitCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), submitTimeout)
+	defer cancel()
+	upstream, err := adaptor.Submit(submitCtx, conn, &SubmitRequest{
 		BatchId:          batchId,
 		Endpoint:         req.Endpoint,
 		UpstreamModel:    info.UpstreamModelName,
@@ -378,16 +406,15 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		Items:            items,
 	})
 	if err != nil {
-		refund()
-		if deleteErr := model.DeleteUnsubmittedBatch(batchId); deleteErr != nil {
-			logger.LogError(c, common.LogText("batch %s: failed to delete the record of a rejected submission: %s", batchId, deleteErr.Error()))
+		// The client gets an error and no batch id, so the record goes too.
+		if releaseUnsubmitted(c, b, "submission_failed", err.Error()) {
+			if deleteErr := model.DeleteUnsubmittedBatch(batchId); deleteErr != nil {
+				logger.LogWarn(c, common.LogText("batch %s: failed to delete the record of a rejected submission: %s", batchId, deleteErr.Error()))
+			}
 		}
 		return nil, submitError(err)
 	}
 
-	if err := service.SettleBilling(c, info, preConsume); err != nil {
-		logger.LogError(c, common.LogText("batch %s: failed to confirm the reservation: %s", batchId, err.Error()))
-	}
 	updates := map[string]any{
 		"upstream_batch_id": upstream.Id,
 		"status":            nonTerminalStatus(upstream.Status, model.BatchStatusValidating),
@@ -397,8 +424,14 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 	if updates["status"] == model.BatchStatusInProgress {
 		updates["in_progress_at"] = now
 	}
-	if _, err := model.UpdateBatchIfStatus(batchId, model.BatchStatusValidating, updates); err != nil {
-		logger.LogError(c, common.LogText("batch %s: submitted as %s but the record update failed: %s", batchId, upstream.Id, err.Error()))
+	if err := saveSubmission(batchId, updates); err != nil {
+		// Without the upstream id the poller refunds the batch, so the
+		// upstream batch is cancelled rather than left running unbilled.
+		logger.LogError(c, common.LogText("batch %s: submitted as %s but the record update failed, cancelling it upstream: %s", batchId, upstream.Id, err.Error()))
+		if _, cancelErr := adaptor.Cancel(submitCtx, conn, upstream.Id); cancelErr != nil {
+			logger.LogError(c, common.LogText("batch %s: failed to cancel upstream batch %s, which keeps running unbilled: %s", batchId, upstream.Id, cancelErr.Error()))
+		}
+		return nil, internalError(err)
 	}
 	recordSubmitLog(c, info, b, ratio, ratioSource, clamp)
 	model.UpdateUserUsedQuotaAndRequestCount(userId, preConsume)
@@ -409,6 +442,50 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		return b, nil
 	}
 	return fresh, nil
+}
+
+// saveSubmission records the upstream id of a submitted batch, retrying
+// briefly since the batch already runs upstream.
+func saveSubmission(batchId string, updates map[string]any) error {
+	var err error
+	for attempt := 0; attempt < submitSaveAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * submitSaveRetryDelay)
+		}
+		var saved bool
+		if saved, err = model.UpdateBatchIfStatus(batchId, model.BatchStatusValidating, updates); err == nil {
+			if saved {
+				return nil
+			}
+			return errors.New("the batch is no longer waiting for its submission")
+		}
+	}
+	return err
+}
+
+// releaseUnsubmitted marks a batch that never reached the upstream failed and
+// refunds its reservation, reporting whether this call did. When the record
+// cannot be switched to settled the batch stays reserved and the poller
+// refunds it after the grace period.
+func releaseUnsubmitted(ctx context.Context, b *model.Batch, code string, reason string) bool {
+	won, err := model.SettleBatch(b.BatchId, map[string]any{
+		"status":    model.BatchStatusFailed,
+		"failed_at": common.GetTimestamp(),
+		"errors":    batchErrorsJSON(code, reason),
+		"quota":     0,
+	}, nil)
+	if err != nil {
+		logger.LogError(ctx, common.LogText("batch %s: failed to release the reservation of an unsubmitted batch, the poller will: %s", b.BatchId, err.Error()))
+		return false
+	}
+	if !won {
+		return false
+	}
+	if err := service.ReleaseBatchReservation(ctx, batchSettlement(b, 0)); err != nil {
+		logger.LogError(ctx, common.LogText("batch %s is settled in the database but its reservation %d was not refunded; reconcile by hand: %s",
+			b.BatchId, b.Quota, err.Error()))
+	}
+	return true
 }
 
 // nonTerminalStatus keeps a just-submitted batch out of terminal states; a
@@ -543,14 +620,25 @@ func backoff(ctx context.Context, b *model.Batch, now int64, reason string) {
 	}
 }
 
+// upstreamDeadline is when the upstream expires the batch, or the end of its
+// completion window when the upstream reports no expiry.
+func upstreamDeadline(b *model.Batch) int64 {
+	if b.ExpiresAt > 0 {
+		return b.ExpiresAt
+	}
+	return b.CreatedAt + int64(completionWindowDuration.Seconds())
+}
+
 func refreshBatch(ctx context.Context, b *model.Batch, now int64) {
 	if b.UpstreamBatchId == "" {
 		if now-b.CreatedAt >= int64(submitGracePeriod.Seconds()) {
-			giveUp(ctx, b, "submission_lost", "the submission did not complete", 0)
+			logger.LogError(ctx, common.LogText("batch %s (channel %d) has no upstream id after the grace period; refunding its reservation %d",
+				b.BatchId, b.ChannelId, b.Quota))
+			releaseUnsubmitted(ctx, b, "submission_lost", "the submission did not complete")
 		}
 		return
 	}
-	lost := b.ExpiresAt > 0 && now > b.ExpiresAt+int64(upstreamLostAfter.Seconds())
+	lost := now > upstreamDeadline(b)+int64(upstreamLostAfter.Seconds())
 	conn, adaptor, err := resolveConnection(b)
 	if err != nil {
 		if lost {
@@ -562,7 +650,8 @@ func refreshBatch(ctx context.Context, b *model.Batch, now int64) {
 	}
 	upstream, err := adaptor.Retrieve(ctx, conn, b.UpstreamBatchId)
 	if err != nil {
-		if IsUpstreamNotFound(err) || lost {
+		gone := IsUpstreamNotFound(err) && b.PollFailures+1 >= notFoundPollsBeforeGiveUp
+		if gone || lost {
 			giveUp(ctx, b, "upstream_unavailable", err.Error(), b.Quota)
 			return
 		}
@@ -637,23 +726,28 @@ func giveUp(ctx context.Context, b *model.Batch, code string, reason string, quo
 		map[string]any{"batch": b.BatchId, "code": code})}, other)
 }
 
+func batchSettlement(b *model.Batch, actual int) service.BatchSettlement {
+	return service.BatchSettlement{
+		BatchId:        b.BatchId,
+		UserId:         b.UserId,
+		TokenId:        b.TokenId,
+		ChannelId:      b.ChannelId,
+		Group:          b.UsingGroup,
+		ModelName:      b.Model,
+		BillingSource:  b.BillingSource,
+		SubscriptionId: b.SubscriptionId,
+		PreConsumed:    b.Quota,
+		Actual:         actual,
+	}
+}
+
 func settle(ctx context.Context, b *model.Batch, actual int, promptTokens int, completionTokens int, content []*common.Message, other *model.LogOther) {
-	if err := service.SettleBatchCharge(ctx, service.BatchSettlement{
-		BatchId:          b.BatchId,
-		UserId:           b.UserId,
-		TokenId:          b.TokenId,
-		ChannelId:        b.ChannelId,
-		Group:            b.UsingGroup,
-		ModelName:        b.Model,
-		BillingSource:    b.BillingSource,
-		SubscriptionId:   b.SubscriptionId,
-		PreConsumed:      b.Quota,
-		Actual:           actual,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		Content:          content,
-		Other:            other,
-	}); err != nil {
+	settlement := batchSettlement(b, actual)
+	settlement.PromptTokens = promptTokens
+	settlement.CompletionTokens = completionTokens
+	settlement.Content = content
+	settlement.Other = other
+	if err := service.SettleBatchCharge(ctx, settlement); err != nil {
 		logger.LogError(ctx, common.LogText("batch %s is settled in the database but its funds were not adjusted (actual %d, reserved %d); reconcile by hand: %s",
 			b.BatchId, actual, b.Quota, err.Error()))
 	}
@@ -714,7 +808,7 @@ func finalize(ctx context.Context, b *model.Batch, upstream *UpstreamBatch) {
 		}
 		fileId, err := newObjectId("file-")
 		if err != nil {
-			logger.LogError(ctx, common.LogText("batch %s: failed to create a file id: %s", b.BatchId, err.Error()))
+			backoff(ctx, b, now, "failed to create a file id: "+err.Error())
 			return
 		}
 		files = append(files, &model.BatchFile{
@@ -734,7 +828,8 @@ func finalize(ctx context.Context, b *model.Batch, upstream *UpstreamBatch) {
 
 	won, err := model.SettleBatch(b.BatchId, updates, files)
 	if err != nil {
-		logger.LogError(ctx, common.LogText("batch %s: failed to save the final state: %s", b.BatchId, err.Error()))
+		// Each retry downloads the results again, so it backs off.
+		backoff(ctx, b, now, "failed to save the final state: "+err.Error())
 		return
 	}
 	if !won {

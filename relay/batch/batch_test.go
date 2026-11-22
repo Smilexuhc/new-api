@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -285,6 +286,52 @@ func readJSONL(t *testing.T, userId int, fileId string) []map[string]any {
 	return lines
 }
 
+// submittedBodies returns the request bodies of the last submission, in order,
+// from an OpenRouter or a Gemini create call.
+func (f *fakeUpstream) submittedBodies(t *testing.T) [][]byte {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var submitted struct {
+		Requests []struct {
+			Body json.RawMessage `json:"body"`
+		} `json:"requests"`
+		Batch struct {
+			InputConfig struct {
+				Requests struct {
+					Requests []struct {
+						Request json.RawMessage `json:"request"`
+					} `json:"requests"`
+				} `json:"requests"`
+			} `json:"inputConfig"`
+		} `json:"batch"`
+	}
+	require.NoError(t, json.Unmarshal(f.lastSubmit, &submitted))
+	var bodies [][]byte
+	for _, request := range submitted.Requests {
+		bodies = append(bodies, request.Body)
+	}
+	for _, request := range submitted.Batch.InputConfig.Requests.Requests {
+		bodies = append(bodies, request.Request)
+	}
+	return bodies
+}
+
+// submittedUsage estimates every request of the last submission as sent,
+// with the output limit of its input line.
+func submittedUsage(t *testing.T, upstream *fakeUpstream, file *model.BatchFile, defaultMaxOutput int) []*dto.Usage {
+	t.Helper()
+	lines, apiErr := parseInput(file.Content, "", 100)
+	require.Nil(t, apiErr)
+	bodies := upstream.submittedBodies(t)
+	require.Len(t, bodies, len(lines))
+	usages := make([]*dto.Usage, len(lines))
+	for index, line := range lines {
+		usages[index] = estimateUsage(bodies[index], line.outputLimit(defaultMaxOutput))
+	}
+	return usages
+}
+
 func lastLog(t *testing.T) model.Log {
 	t.Helper()
 	var log model.Log
@@ -356,14 +403,13 @@ func TestParseInputRejectsInvalidLines(t *testing.T) {
 
 func TestEstimateUsageCountsBase64MediaByDecodedSize(t *testing.T) {
 	audio := strings.Repeat("A", 400_000)
-	line := &inputLine{RawBody: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"caption"},{"type":"input_audio","input_audio":{"data":"` + audio + `","format":"wav"}}]}]}`)}
-	usage := estimateUsage(line, 50)
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"caption"},{"type":"input_audio","input_audio":{"data":"` + audio + `","format":"wav"}}]}]}`)
+	usage := estimateUsage(body, 50)
 	assert.Equal(t, 50, usage.CompletionTokens)
-	assert.Equal(t, 300_000/audioBytesPerToken+1, usage.PromptTokensDetails.AudioTokens)
+	assert.Equal(t, 300_000/pcmAudioBytesPerToken+1, usage.PromptTokensDetails.AudioTokens)
 	assert.Less(t, usage.PromptTokens, 700, "base64 audio must not be priced as text")
 
-	text := &inputLine{RawBody: []byte(strings.Repeat("x", 300)), MaxOutputTokens: 8}
-	usage = estimateUsage(text, 50)
+	usage = estimateUsage([]byte(strings.Repeat("x", 300)), 8)
 	assert.Equal(t, 100, usage.PromptTokens)
 	assert.Equal(t, 8, usage.CompletionTokens)
 }
@@ -462,10 +508,8 @@ func TestBatchReservesEstimateAndSettlesFromUpstreamUsage(t *testing.T) {
 	assert.Equal(t, 1, upstream.submits)
 	assert.Contains(t, string(upstream.lastSubmit), `"model":"`+testModel+`"`)
 
-	lines, _ := parseInput(file.Content, "", 100)
 	reserved := 0
-	for _, line := range lines {
-		usage := estimateUsage(line, 100)
+	for _, usage := range submittedUsage(t, upstream, file, 100) {
 		reserved += expectedQuota(usage.PromptTokens, usage.CompletionTokens, 0.5)
 	}
 	assert.Equal(t, reserved, b.Quota, "the reservation is the estimate at half price")
@@ -810,10 +854,8 @@ func TestGeminiBatchBillsBuiltinExpressionAtBatchRatio(t *testing.T) {
 	price := func(text, audio, output int, ratio float64) int {
 		return int(math.Round((float64(text)*0.25 + float64(audio)*0.5 + float64(output)*1.5) / 1e6 * 500000 * ratio))
 	}
-	lines, _ := parseInput(file.Content, "", 100)
 	reserved := 0
-	for _, line := range lines {
-		usage := estimateUsage(line, 100)
+	for _, usage := range submittedUsage(t, upstream, file, 100) {
 		reserved += price(usage.PromptTokens, 0, usage.CompletionTokens, 0.5)
 	}
 	assert.Equal(t, reserved, b.Quota)
@@ -931,6 +973,11 @@ func TestBatchUpstreamNotFoundKeepsReservation(t *testing.T) {
 	upstream.mu.Lock()
 	upstream.retrieveCode = http.StatusNotFound
 	upstream.mu.Unlock()
+	for attempt := 1; attempt < notFoundPollsBeforeGiveUp; attempt++ {
+		waiting := poll(t, b.BatchId)
+		require.Equal(t, model.BatchBillingReserved, waiting.BillingState, "a single not found does not end the batch")
+		assert.Equal(t, attempt, waiting.PollFailures)
+	}
 	failed := poll(t, b.BatchId)
 	assert.Equal(t, model.BatchStatusFailed, failed.Status)
 	assert.Equal(t, model.BatchBillingSettled, failed.BillingState)

@@ -27,21 +27,34 @@ const (
 	BatchRatioSourceUpstream = "upstream_default"
 )
 
-// Media in a request body is base64, which is far larger than its token
-// count. Its decoded size estimates the tokens instead: about one token per
-// 500 bytes of audio (Gemini counts 32 tokens per second, 16 kHz 16-bit WAV
-// is 32 KB per second) and a base image cost plus one token per 250 bytes for
-// images. Both err high; settlement refunds the difference.
-var (
-	dataURIPattern    = regexp.MustCompile(`data:([A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)`)
-	inputAudioPattern = regexp.MustCompile(`"data"\s*:\s*"([A-Za-z0-9+/=]{256,})"`)
-)
+var dataURIPattern = regexp.MustCompile(`data:([A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)`)
 
+// Media carried in a body is base64, far larger than its token count, so its
+// decoded size estimates the tokens. Media given only as a link is not
+// fetched and gets a fixed allowance. All rates err high for typical media;
+// settlement charges what the upstream reports and refunds the rest.
 const (
-	audioBytesPerToken = 500
-	imageBytesPerToken = 250
+	textBytesPerToken = 3
+
 	imageBaseTokens    = 258
-	textBytesPerToken  = 3
+	imageBytesPerToken = 250
+	// Audio costs 32 tokens per second. 16 kHz 16-bit PCM is 32 KB per
+	// second; compressed audio goes down to about 3 KB per second.
+	pcmAudioBytesPerToken        = 500
+	compressedAudioBytesPerToken = 90
+	// Video costs up to about 300 tokens per second (a frame per second plus
+	// its audio); 100 bytes per token covers streams down to 240 kbps.
+	videoBytesPerToken = 100
+	// A document page costs up to about 1,500 tokens.
+	documentBytesPerToken = 20
+
+	// A linked image costs at most about 1,600 tokens at default resolution.
+	remoteImageTokens = 1600
+	// A linked video or audio is assumed to last up to ten minutes; a longer
+	// one is charged in full at settlement.
+	remoteVideoTokens    = 600 * 300
+	remoteAudioTokens    = 600 * 32
+	remoteDocumentTokens = 20 * 1500
 )
 
 // billingSnapshot freezes the price of a batch when it is created, so a price
@@ -89,39 +102,181 @@ func priceItem(c *gin.Context, info *relaycommon.RelayInfo, line *inputLine, usa
 	return service.PriceTextUsage(c, info, usage)
 }
 
-// estimateUsage is the most a request can use: its estimated input and its
-// output limit.
-func estimateUsage(line *inputLine, defaultMaxOutput int) *dto.Usage {
-	body := string(line.RawBody)
-	remaining := len(body)
-	audioTokens := 0
-	imageTokens := 0
-	for _, match := range dataURIPattern.FindAllStringSubmatch(body, -1) {
-		remaining -= len(match[0])
-		decoded := len(match[2]) * 3 / 4
-		if strings.HasPrefix(match[1], "audio/") {
-			audioTokens += decoded/audioBytesPerToken + 1
-		} else {
-			imageTokens += imageBaseTokens + decoded/imageBytesPerToken
-		}
+// estimateUsage is the usage a request is expected to stay within: the input
+// estimated from body, which is the request in OpenAI chat or Gemini format,
+// and maxOutput, the output limit sent upstream.
+func estimateUsage(body []byte, maxOutput int) *dto.Usage {
+	var estimate mediaEstimate
+	var root any
+	if err := common.Unmarshal(body, &root); err == nil {
+		estimate.walk(root)
 	}
-	for _, match := range inputAudioPattern.FindAllStringSubmatch(body, -1) {
-		remaining -= len(match[0])
-		audioTokens += (len(match[1])*3/4)/audioBytesPerToken + 1
-	}
-	textTokens := (max(remaining, 0) + textBytesPerToken - 1) / textBytesPerToken
-	output := line.MaxOutputTokens
-	if output <= 0 {
-		output = defaultMaxOutput
-	}
+	textTokens := (max(len(body)-estimate.payloadBytes, 0) + textBytesPerToken - 1) / textBytesPerToken
 	usage := &dto.Usage{
-		PromptTokens:     textTokens + audioTokens + imageTokens,
-		CompletionTokens: output,
+		PromptTokens:     textTokens + estimate.audioTokens + estimate.visualTokens,
+		CompletionTokens: maxOutput,
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-	usage.PromptTokensDetails.AudioTokens = audioTokens
-	usage.PromptTokensDetails.TextTokens = textTokens + imageTokens
+	usage.PromptTokensDetails.AudioTokens = estimate.audioTokens
+	// Images, video and documents bill at the text input price.
+	usage.PromptTokensDetails.TextTokens = textTokens + estimate.visualTokens
 	return usage
+}
+
+// mediaEstimate sums the tokens of the media in a request. payloadBytes is
+// the base64 it found, which is not counted as text.
+type mediaEstimate struct {
+	payloadBytes int
+	audioTokens  int
+	visualTokens int
+}
+
+func (e *mediaEstimate) walk(value any) {
+	switch v := value.(type) {
+	case []any:
+		for _, item := range v {
+			e.walk(item)
+		}
+	case map[string]any:
+		for key, child := range v {
+			if !e.field(key, child) {
+				e.walk(child)
+			}
+		}
+	case string:
+		e.dataURIs(v)
+	}
+}
+
+// field estimates a media field of an OpenAI chat or Gemini request and
+// reports whether it did. Data URIs are left to walk, which finds them in any
+// string, markdown images included.
+func (e *mediaEstimate) field(key string, value any) bool {
+	switch key {
+	case "image_url", "video_url":
+		url := mediaURL(value)
+		if url == "" || strings.HasPrefix(url, "data:") {
+			return false
+		}
+		if key == "image_url" {
+			e.visualTokens += remoteImageTokens
+		} else {
+			e.visualTokens += remoteVideoTokens
+		}
+		return true
+	case "input_audio":
+		audio, ok := value.(map[string]any)
+		data, _ := audio["data"].(string)
+		if !ok || data == "" || strings.HasPrefix(data, "data:") {
+			return false
+		}
+		format, _ := audio["format"].(string)
+		e.inline("audio/"+format, data)
+		return true
+	case "file":
+		file, ok := value.(map[string]any)
+		if !ok {
+			return false
+		}
+		data, _ := file["file_data"].(string)
+		id, _ := file["file_id"].(string)
+		if strings.HasPrefix(data, "data:") || (data == "" && id == "") {
+			return false
+		}
+		e.visualTokens += remoteDocumentTokens
+		return true
+	case "inlineData", "inline_data":
+		inline, ok := value.(map[string]any)
+		data, _ := inline["data"].(string)
+		if !ok || data == "" {
+			return false
+		}
+		e.inline(firstString(inline, "mimeType", "mime_type"), data)
+		return true
+	case "fileData", "file_data":
+		// Gemini fileData is an object; OpenAI file_data is a string.
+		file, ok := value.(map[string]any)
+		if !ok {
+			return false
+		}
+		e.remote(firstString(file, "mimeType", "mime_type"))
+		return true
+	}
+	return false
+}
+
+func (e *mediaEstimate) dataURIs(text string) {
+	if !strings.Contains(text, "data:") {
+		return
+	}
+	for _, match := range dataURIPattern.FindAllStringSubmatch(text, -1) {
+		e.payloadBytes += len(match[0]) - len(match[2])
+		e.inline(match[1], match[2])
+	}
+}
+
+func (e *mediaEstimate) inline(mimeType string, base64Data string) {
+	e.payloadBytes += len(base64Data)
+	decoded := len(base64Data) * 3 / 4
+	mimeType = strings.ToLower(mimeType)
+	switch {
+	case strings.HasPrefix(mimeType, "audio/"):
+		if isPCMAudio(mimeType) {
+			e.audioTokens += decoded/pcmAudioBytesPerToken + 1
+		} else {
+			e.audioTokens += decoded/compressedAudioBytesPerToken + 1
+		}
+	case strings.HasPrefix(mimeType, "video/"):
+		e.visualTokens += decoded/videoBytesPerToken + 1
+	case strings.HasPrefix(mimeType, "image/"):
+		e.visualTokens += imageBaseTokens + decoded/imageBytesPerToken
+	default:
+		e.visualTokens += imageBaseTokens + decoded/documentBytesPerToken
+	}
+}
+
+func (e *mediaEstimate) remote(mimeType string) {
+	mimeType = strings.ToLower(mimeType)
+	switch {
+	case strings.HasPrefix(mimeType, "audio/"):
+		e.audioTokens += remoteAudioTokens
+	case strings.HasPrefix(mimeType, "video/"):
+		e.visualTokens += remoteVideoTokens
+	case strings.HasPrefix(mimeType, "image/"):
+		e.visualTokens += remoteImageTokens
+	default:
+		e.visualTokens += remoteDocumentTokens
+	}
+}
+
+func isPCMAudio(mimeType string) bool {
+	switch strings.TrimPrefix(mimeType, "audio/") {
+	case "wav", "wave", "x-wav", "pcm", "l16", "aiff", "x-aiff":
+		return true
+	}
+	return false
+}
+
+// mediaURL reads an OpenAI image_url or video_url, which is a string or an
+// object with url.
+func mediaURL(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case map[string]any:
+		url, _ := v["url"].(string)
+		return url
+	}
+	return ""
+}
+
+func firstString(object map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := object[key].(string); ok && value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 type itemCharge struct {
@@ -131,15 +286,21 @@ type itemCharge struct {
 	Estimated        bool
 }
 
-// estimateCharges prices every line at its estimated maximum usage. Each
-// charge saturates at the single-request bound, so the int64 total cannot wrap;
-// the clamp, if any, belongs in the submit log.
-func estimateCharges(c *gin.Context, snapshot *billingSnapshot, lines []*inputLine) ([]int, int, *common.QuotaClamp, error) {
+// estimateCharges prices every line at its estimated usage. bodies holds the
+// requests as sent upstream, in line order; without them a line is estimated
+// from its uploaded body. Each charge saturates at the single-request bound,
+// so the int64 total cannot wrap; the clamp, if any, belongs in the submit log.
+func estimateCharges(c *gin.Context, snapshot *billingSnapshot, lines []*inputLine, bodies [][]byte) ([]int, int, *common.QuotaClamp, error) {
 	info := snapshot.relayInfo()
 	charges := make([]int, len(lines))
 	total := 0
 	for index, line := range lines {
-		price, err := priceItem(c, info, line, estimateUsage(line, snapshot.DefaultMaxOutputTokens))
+		body := line.RawBody
+		if index < len(bodies) {
+			body = bodies[index]
+		}
+		usage := estimateUsage(body, line.outputLimit(snapshot.DefaultMaxOutputTokens))
+		price, err := priceItem(c, info, line, usage)
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("request %s: %w", line.CustomId, err)
 		}

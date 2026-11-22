@@ -107,7 +107,7 @@ type Batch struct {
 	PollFailures int
 
 	Quota          int
-	BillingState   string `gorm:"type:varchar(16)"`
+	BillingState   string `gorm:"type:varchar(16);index"`
 	BillingSource  string `gorm:"type:varchar(16)"`
 	SubscriptionId int
 	BillingContext string `gorm:"type:text"`
@@ -177,10 +177,21 @@ func DeleteBatchFile(userId int, fileId string) error {
 	})
 }
 
-// DeleteExpiredBatchFiles removes up to limit files whose retention ended.
+// HasExpiredBatchFiles reports whether a file's retention has ended.
+func HasExpiredBatchFiles(now int64) bool {
+	var id int
+	err := DB.Model(&BatchFile{}).Where("expires_at > 0 AND expires_at <= ?", now).Limit(1).Pluck("id", &id).Error
+	return err == nil && id != 0
+}
+
+// DeleteExpiredBatchFiles removes up to limit files whose retention ended,
+// except the inputs of batches not yet settled, whose settlement reads them.
 func DeleteExpiredBatchFiles(now int64, limit int) (int64, error) {
 	var ids []int
-	if err := DB.Model(&BatchFile{}).Where("expires_at > 0 AND expires_at <= ?", now).Limit(limit).Pluck("id", &ids).Error; err != nil {
+	inUse := DB.Model(&Batch{}).Select("input_file_id").
+		Where("status IN ? OR billing_state = ?", unfinishedBatchStatuses, BatchBillingReserved)
+	if err := DB.Model(&BatchFile{}).Where("expires_at > 0 AND expires_at <= ?", now).
+		Where("file_id NOT IN (?)", inUse).Limit(limit).Pluck("id", &ids).Error; err != nil {
 		return 0, err
 	}
 	if len(ids) == 0 {
@@ -284,10 +295,10 @@ func SettleBatch(batchId string, updates map[string]any, files []*BatchFile) (bo
 	return won, err
 }
 
-// DeleteUnsubmittedBatch removes the record of a batch the upstream rejected,
-// whose reservation the caller refunds.
+// DeleteUnsubmittedBatch removes the record of a batch that never reached the
+// upstream once its reservation is settled.
 func DeleteUnsubmittedBatch(batchId string) error {
-	return DB.Where("batch_id = ? AND upstream_batch_id = ? AND billing_state = ?", batchId, "", BatchBillingReserved).
+	return DB.Where("batch_id = ? AND upstream_batch_id = ? AND billing_state = ?", batchId, "", BatchBillingSettled).
 		Delete(&Batch{}).Error
 }
 
