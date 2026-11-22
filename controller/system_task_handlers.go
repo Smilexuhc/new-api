@@ -204,14 +204,15 @@ func (asyncTaskPollHandler) Run(ctx context.Context, task *model.SystemTask, run
 }
 
 // batchPollHandler syncs native upstream batches, settles finished ones and
-// deletes expired batch files. It is scheduled only while the batch API is
-// enabled and a batch is unfinished or unsettled.
+// deletes expired batch files. It is scheduled while a batch is unfinished or
+// unsettled or a file has expired, also with the batch API disabled, so
+// turning the API off does not strand reservations.
 type batchPollHandler struct{}
 
 func (batchPollHandler) Type() string { return model.SystemTaskTypeBatchPoll }
 
 func (batchPollHandler) Enabled() bool {
-	return operation_setting.GetBatchSetting().Enabled && model.HasUnfinishedBatches()
+	return model.HasUnfinishedBatches() || model.HasExpiredBatchFiles(common.GetTimestamp())
 }
 
 func (batchPollHandler) Interval() time.Duration { return 15 * time.Second }

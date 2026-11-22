@@ -193,9 +193,9 @@ func SetRelayRouter(router *gin.Engine) {
 	batchRouter.Use(middleware.RouteTag("relay"))
 	batchRouter.Use(middleware.SystemPerformanceCheck())
 	batchRouter.Use(middleware.TokenAuth())
-	batchRouter.Use(middleware.ModelRequestRateLimit())
 	{
-		batchRouter.POST("", controller.CreateBatch)
+		// Only creating a batch counts as a model request; polling does not.
+		batchRouter.POST("", middleware.ModelRequestRateLimit(), controller.CreateBatch)
 		batchRouter.GET("", controller.ListBatches)
 		batchRouter.GET("/:id", controller.RetrieveBatch)
 		batchRouter.POST("/:id/cancel", controller.CancelBatch)
