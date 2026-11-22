@@ -44,14 +44,19 @@ func BatchFunding(s BatchSettlement) *model.BatchFunding {
 // its reservation at submission, so it records the difference; an uncounted
 // one records its final charge, and nothing if it is free.
 func RecordBatchSettlement(ctx context.Context, s BatchSettlement, applied *model.BatchFundingResult) {
-	delta := s.Actual - s.PreConsumed
+	uncollected := 0
+	if applied != nil {
+		uncollected = applied.Uncollected
+	}
+	delta := s.Actual - s.PreConsumed - uncollected
 	if s.Uncounted {
-		if s.Actual <= 0 {
+		charged := s.Actual - uncollected
+		if charged <= 0 {
 			return
 		}
-		delta = s.Actual
-		model.UpdateUserUsedQuotaAndRequestCount(s.UserId, s.Actual)
-		model.UpdateChannelUsedQuota(s.ChannelId, s.Actual)
+		delta = charged
+		model.UpdateUserUsedQuotaAndRequestCount(s.UserId, charged)
+		model.UpdateChannelUsedQuota(s.ChannelId, charged)
 	} else if delta != 0 {
 		// Submission counted the request; settlement only moves the quota.
 		model.UpdateUserUsedQuota(s.UserId, delta)
@@ -73,6 +78,10 @@ func RecordBatchSettlement(ctx context.Context, s BatchSettlement, applied *mode
 	other.SetPublic("actual_quota", s.Actual)
 	if applied != nil && s.BillingSource == BillingSourceSubscription && delta > 0 && applied.WalletDelta > 0 {
 		other.SetPublic("wallet_overflow_quota", applied.WalletDelta)
+	}
+	if uncollected > 0 {
+		other.SetAdmin("uncollected_quota", uncollected)
+		common.SysLog(common.LogText("batch %s: %d quota beyond the subscription was not charged because the subscription does not allow wallet overflow", s.BatchId, uncollected))
 	}
 	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
 		UserId:           s.UserId,

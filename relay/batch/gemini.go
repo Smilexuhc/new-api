@@ -140,7 +140,7 @@ func (a *geminiAdaptor) Submit(ctx context.Context, conn *Connection, req *Submi
 		if errors.Is(err, errGeminiNoName) {
 			return nil, ErrNoUpstreamId
 		}
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrNoUpstreamId, err)
 	}
 	batch.ExpiresAt = time.Now().Add(geminiBatchLifetime).Unix()
 	return batch, nil
@@ -153,6 +153,8 @@ func (a *geminiAdaptor) Retrieve(ctx context.Context, conn *Connection, upstream
 	}
 	return parseGeminiOperation(data)
 }
+
+func (a *geminiAdaptor) SupportsCancel() bool { return true }
 
 // Cancel requests the cancellation; once the upstream accepted it, a failed
 // read of the new state does not undo it.

@@ -277,7 +277,9 @@ func (e *mediaEstimate) inline(mimeType string, base64Data string) {
 	case strings.HasPrefix(mimeType, "video/"):
 		e.visualTokens += videoTokens(base64Data)
 	case strings.HasPrefix(mimeType, "image/"):
-		e.visualTokens += imageBaseTokens + decoded/imageBytesPerToken
+		// Gemini 3 bills an image by resolution, not size, so a small file
+		// still costs about 1,100 tokens.
+		e.visualTokens += max(remoteImageTokens, imageBaseTokens+decoded/imageBytesPerToken)
 	default:
 		e.visualTokens += imageBaseTokens + decoded/documentBytesPerToken
 	}

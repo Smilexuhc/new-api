@@ -76,6 +76,9 @@ const (
 	maxRemoteMediaPerBatch = 1000
 )
 
+// pollRoundBudget bounds how long a poll round waits for its workers.
+var pollRoundBudget = time.Minute
+
 func keyFingerprint(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:16])
@@ -474,10 +477,11 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		CompletionWindow: req.CompletionWindow,
 		Items:            items,
 	})
-	if errors.Is(err, ErrNoUpstreamId) {
+	if submissionUnconfirmed(err) {
 		// The upstream may run and bill the batch, which cannot be tracked;
 		// the reservation waits for an administrator.
-		if holdWith(c, b, "submission_unconfirmed", "the upstream accepted the batch without returning its id",
+		logger.LogError(c, common.LogText("batch %s: submission unconfirmed: %s", batchId, err.Error()))
+		if holdWith(c, b, "submission_unconfirmed", "the submission may have reached the upstream, which did not confirm it; an upstream Gemini batch carries the batch id as its display name",
 			map[string]any{"submission_unrecorded": false}) {
 			recordSubmission(c, info, b, ratio, ratioSource, clamp)
 		}
@@ -605,6 +609,18 @@ func nonTerminalStatus(status string, fallback string) string {
 	return fallback
 }
 
+// submissionUnconfirmed reports whether a failed submission may still have
+// created an upstream batch: the upstream accepted it without a readable id,
+// its answer was lost, or a gateway in between failed or timed out.
+func submissionUnconfirmed(err error) bool {
+	if errors.Is(err, ErrNoUpstreamId) || errors.Is(err, errResponseLost) {
+		return true
+	}
+	var upstreamErr *UpstreamError
+	return errors.As(err, &upstreamErr) &&
+		(upstreamErr.StatusCode == http.StatusBadGateway || upstreamErr.StatusCode == http.StatusGatewayTimeout)
+}
+
 func submitError(err error) *Error {
 	if errors.Is(err, ErrGeminiInlineTooLarge) {
 		return newError(http.StatusBadRequest, "invalid_request_error", i18n.MsgBatchInlineTooLarge, map[string]any{"MaxMB": GeminiInlineRequestLimit >> 20})
@@ -679,28 +695,47 @@ func resolveConnection(b *model.Batch) (*Connection, Adaptor, error) {
 		return nil, nil, errors.New("no batch adaptor for the channel type")
 	}
 	channel, err := model.GetChannelById(b.ChannelId, true)
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, nil, errConnectionGone
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil, err
 	}
-	for _, key := range channel.GetKeys() {
-		if keyFingerprint(key) == b.KeyFingerprint {
-			return &Connection{
-				ChannelType: channel.Type,
-				BaseURL:     channelBaseURL(channel),
-				Key:         key,
-				Proxy:       channel.GetSetting().Proxy,
-			}, adaptor, nil
+	if err == nil {
+		if conn := connectionWithKey(channel, b.KeyFingerprint); conn != nil {
+			return conn, adaptor, nil
+		}
+	}
+	// The key may have moved to another channel of the same type, which
+	// reaches the same upstream account.
+	var channels []*model.Channel
+	if err := model.DB.Where("type = ? AND id <> ?", b.ChannelType, b.ChannelId).Find(&channels).Error; err != nil {
+		return nil, nil, err
+	}
+	for _, other := range channels {
+		if conn := connectionWithKey(other, b.KeyFingerprint); conn != nil {
+			return conn, adaptor, nil
 		}
 	}
 	return nil, nil, errConnectionGone
 }
 
+func connectionWithKey(channel *model.Channel, fingerprint string) *Connection {
+	for _, key := range channel.GetKeys() {
+		if keyFingerprint(key) == fingerprint {
+			return &Connection{
+				ChannelType: channel.Type,
+				BaseURL:     channelBaseURL(channel),
+				Key:         key,
+				Proxy:       channel.GetSetting().Proxy,
+			}
+		}
+	}
+	return nil
+}
+
 // PollOnce refreshes the batches whose poll time has come, a few at a time so
-// one slow upstream does not hold up the others. It returns the number of
-// batches it looked at.
+// one slow upstream does not hold up the others. Each batch is claimed for
+// as long as a read may take; a round waits for its workers at most
+// pollRoundBudget and leaves slower ones running. It returns the number of
+// batches it claimed.
 func PollOnce(ctx context.Context) int {
 	now := common.GetTimestamp()
 	batches, err := model.FindDueBatches(now, pollBatchSize)
@@ -708,29 +743,52 @@ func PollOnce(ctx context.Context) int {
 		logger.LogError(ctx, common.LogText("batch poll: failed to load due batches: %s", err.Error()))
 		return 0
 	}
+	workerCtx := context.WithoutCancel(ctx)
+	round, endRound := context.WithTimeout(context.Background(), pollRoundBudget)
+	defer endRound()
 	workers := make(chan struct{}, pollWorkers)
 	var wg sync.WaitGroup
+	claimed := 0
+dispatch:
 	for _, b := range batches {
+		select {
+		case workers <- struct{}{}:
+		case <-round.Done():
+			break dispatch
+		}
+		lease := common.GetTimestamp() + int64((retrieveTimeout + time.Minute).Seconds()) + pollInterval()
+		if ok, err := model.ClaimBatchPoll(b.BatchId, b.NextPollAt, lease); err != nil || !ok {
+			<-workers
+			if err != nil {
+				logger.LogError(ctx, common.LogText("batch %s: failed to claim its poll: %s", b.BatchId, err.Error()))
+			}
+			continue
+		}
+		claimed++
 		wg.Add(1)
-		workers <- struct{}{}
 		go func(b *model.Batch) {
 			defer wg.Done()
 			defer func() { <-workers }()
 			defer func() {
 				if recovered := recover(); recovered != nil {
-					logger.LogError(ctx, common.LogText("batch %s: poll panicked: %v", b.BatchId, recovered))
+					logger.LogError(workerCtx, common.LogText("batch %s: poll panicked: %v", b.BatchId, recovered))
 				}
 			}()
-			refreshBatch(ctx, b, now)
+			refreshBatch(workerCtx, b, common.GetTimestamp())
 		}(b)
 	}
-	wg.Wait()
+	finished := make(chan struct{})
+	go func() { wg.Wait(); close(finished) }()
+	select {
+	case <-finished:
+	case <-round.Done():
+	}
 	if deleted, err := model.DeleteExpiredBatchFiles(now, pollBatchSize); err != nil {
 		logger.LogWarn(ctx, common.LogText("batch poll: failed to delete expired files: %s", err.Error()))
 	} else if deleted > 0 {
 		logger.LogInfo(ctx, common.LogText("batch poll: deleted %d expired files", deleted))
 	}
-	return len(batches)
+	return claimed
 }
 
 func pollInterval() int64 {
@@ -802,6 +860,7 @@ func refreshBatch(ctx context.Context, b *model.Batch, now int64) {
 	retrieveCtx, cancel := context.WithTimeout(ctx, retrieveTimeout)
 	defer cancel()
 	upstream, err := adaptor.Retrieve(retrieveCtx, conn, b.UpstreamBatchId)
+	now = common.GetTimestamp()
 	if err != nil {
 		notFoundPolls := 0
 		if IsUpstreamNotFound(err) {
@@ -1105,11 +1164,18 @@ func CancelBatch(c *gin.Context, batchId string) (*model.Batch, *Error) {
 	if err != nil {
 		return nil, internalError(err)
 	}
-	// Cancelling a batch the upstream just finished can drop its results.
+	if !adaptor.SupportsCancel() {
+		return nil, newError(http.StatusBadRequest, "cancel_not_supported", i18n.MsgBatchCancelNotSupported, nil)
+	}
+	// Cancelling a batch the upstream just finished can drop its results, so
+	// a batch whose upstream state cannot be read is not cancelled.
 	retrieveCtx, cancelRetrieve := context.WithTimeout(c.Request.Context(), cancelCheckTimeout)
 	upstream, err := adaptor.Retrieve(retrieveCtx, conn, b.UpstreamBatchId)
 	cancelRetrieve()
-	if err == nil && isTerminalStatus(upstream.Status) {
+	if err != nil {
+		return nil, submitError(err)
+	}
+	if isTerminalStatus(upstream.Status) {
 		_, _ = model.UpdateBatchIfStatus(b.BatchId, b.Status, map[string]any{"next_poll_at": common.GetTimestamp()})
 		return nil, newError(http.StatusConflict, "invalid_request_error", i18n.MsgBatchCannotCancel, map[string]any{"Status": upstream.Status})
 	}

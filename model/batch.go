@@ -378,6 +378,15 @@ func FindDueBatches(now int64, limit int) ([]*Batch, error) {
 	return batches, err
 }
 
+// ClaimBatchPoll moves the next poll of a due batch to leaseUntil, so no other
+// round or node polls it meanwhile. It reports false when the batch is no
+// longer due at the time it was loaded with.
+func ClaimBatchPoll(batchId string, dueAt int64, leaseUntil int64) (bool, error) {
+	result := DB.Model(&Batch{}).Where("batch_id = ? AND billing_state = ? AND next_poll_at = ?", batchId, BatchBillingReserved, dueAt).
+		Update("next_poll_at", leaseUntil)
+	return result.RowsAffected > 0, result.Error
+}
+
 // UpdateBatchIfStatus applies updates only while the batch still has
 // fromStatus and is reserved, so concurrent writers cannot move it backwards
 // or touch a batch another node settled or held.

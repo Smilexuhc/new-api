@@ -25,12 +25,16 @@ type BatchFundingResult struct {
 	TokenId           int
 	TokenKey          string
 	TokenDelta        int
+	// Uncollected is the part of a charge the paying subscription could not
+	// cover and does not let the wallet pay.
+	Uncollected int
 }
 
 // applyBatchFunding moves the settlement delta inside the settlement
-// transaction. A charge that the paying subscription cannot cover, or a
-// subscription that no longer exists, falls to the wallet, which may go
-// negative like a synchronous post-consume charge.
+// transaction. A charge that the paying subscription cannot cover falls to
+// the wallet, which may go negative like a synchronous post-consume charge,
+// unless the subscription forbids it; then that part goes uncollected. A
+// charge for a subscription that no longer exists falls to the wallet.
 func applyBatchFunding(tx *gorm.DB, f *BatchFunding) (*BatchFundingResult, error) {
 	result := &BatchFundingResult{UserId: f.UserId, TokenId: f.TokenId}
 	if f.Delta == 0 {
@@ -58,6 +62,10 @@ func applyBatchFunding(tx *gorm.DB, f *BatchFunding) (*BatchFundingResult, error
 			result.SubscriptionDelta = subDelta
 			if f.Delta > 0 {
 				walletDelta = f.Delta - subDelta
+				if !sub.AllowWalletOverflow {
+					result.Uncollected = walletDelta
+					walletDelta = 0
+				}
 			} else {
 				walletDelta = 0
 			}
@@ -76,20 +84,20 @@ func applyBatchFunding(tx *gorm.DB, f *BatchFunding) (*BatchFundingResult, error
 		}
 		result.WalletDelta = walletDelta
 	}
-	if f.TokenId > 0 {
+	if tokenDelta := f.Delta - result.Uncollected; f.TokenId > 0 && tokenDelta != 0 {
 		var token Token
 		err := tx.Where("id = ?", f.TokenId).First(&token).Error
 		switch {
 		case err == nil:
 			if err := tx.Model(&Token{}).Where("id = ?", f.TokenId).Updates(map[string]any{
-				"remain_quota":  gorm.Expr("remain_quota - ?", f.Delta),
-				"used_quota":    gorm.Expr("used_quota + ?", f.Delta),
+				"remain_quota":  gorm.Expr("remain_quota - ?", tokenDelta),
+				"used_quota":    gorm.Expr("used_quota + ?", tokenDelta),
 				"accessed_time": common.GetTimestamp(),
 			}).Error; err != nil {
 				return nil, err
 			}
 			result.TokenKey = token.Key
-			result.TokenDelta = f.Delta
+			result.TokenDelta = tokenDelta
 		case errors.Is(err, gorm.ErrRecordNotFound):
 		default:
 			return nil, err

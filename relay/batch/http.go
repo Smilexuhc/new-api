@@ -3,8 +3,10 @@ package batch
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 
@@ -41,20 +43,38 @@ func doUpstream(ctx context.Context, conn *Connection, method string, url string
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		if requestNeverSent(err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %w", errResponseLost, err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errResponseLost, err)
 	}
 	if len(data) > maxUpstreamResponseBytes {
-		return nil, fmt.Errorf("upstream response exceeds %d bytes", maxUpstreamResponseBytes)
+		return nil, fmt.Errorf("%w: upstream response exceeds %d bytes", errResponseLost, maxUpstreamResponseBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Message: cleanMessage(upstreamErrorMessage(data), conn.BaseURL)}
 	}
 	return data, nil
+}
+
+// errResponseLost marks a request that may have reached the upstream but
+// whose response was not read.
+var errResponseLost = errors.New("the upstream response was lost")
+
+// requestNeverSent reports whether a transport error happened before the
+// request could reach the upstream.
+func requestNeverSent(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && (opErr.Op == "dial" || opErr.Op == "proxyconnect")
 }
 
 // upstreamErrorMessage extracts error.message from an error body, falling

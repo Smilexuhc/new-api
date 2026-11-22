@@ -202,8 +202,9 @@ func TestEstimateUsageCountsEveryMediaKind(t *testing.T) {
 		{"gemini inline video", gemini(`{"inlineData":{"mimeType":"video/mp4","data":"` + b64(999_999) + `"}}`), 999_999/videoBytesPerToken + 1, 0},
 		{"gemini linked video", gemini(`{"fileData":{"mimeType":"video/mp4","fileUri":"https://example.com/a.mp4"}}`), remoteVideoTokens, 0},
 		{"gemini linked image", gemini(`{"fileData":{"mimeType":"image/png","fileUri":"https://example.com/a.png"}}`), remoteImageTokens, 0},
-		{"image data URI", chat(`{"type":"image_url","image_url":{"url":"data:image/png;base64,` + b64(300_000) + `"}}`), imageBaseTokens + 300_000/imageBytesPerToken, 0},
-		{"markdown image in text", `{"messages":[{"role":"user","content":"look ![x](data:image/png;base64,` + b64(3000) + `)"}]}`, imageBaseTokens + 3000/imageBytesPerToken, 0},
+		{"image data URI", chat(`{"type":"image_url","image_url":{"url":"data:image/png;base64,` + b64(300_000) + `"}}`), remoteImageTokens, 0},
+		{"large image data URI", chat(`{"type":"image_url","image_url":{"url":"data:image/png;base64,` + b64(600_000) + `"}}`), imageBaseTokens + 600_000/imageBytesPerToken, 0},
+		{"markdown image in text", `{"messages":[{"role":"user","content":"look ![x](data:image/png;base64,` + b64(3000) + `)"}]}`, remoteImageTokens, 0},
 		{"compressed audio", chat(`{"type":"input_audio","input_audio":{"data":"` + b64(90_000) + `","format":"mp3"}}`), 0, 90_000/compressedAudioBytesPerToken + 1},
 		{"pcm audio", chat(`{"type":"input_audio","input_audio":{"data":"` + b64(498_000) + `","format":"wav"}}`), 0, 498_000/pcmAudioBytesPerToken + 1},
 		{"gemini inline audio", gemini(`{"inlineData":{"mimeType":"audio/ogg","data":"` + b64(9000) + `"}}`), 0, 9000/compressedAudioBytesPerToken + 1},
@@ -221,7 +222,6 @@ func TestEstimateUsageCountsEveryMediaKind(t *testing.T) {
 			assert.Equal(t, 10, usage.CompletionTokens)
 		})
 	}
-	assert.Greater(t, 2*remoteImageTokens, 2*imageBaseTokens, "a linked image is reserved at least like a small inline one")
 }
 
 // TestVideoEstimateCoversGeminiVideoCost checks the inline video rate against

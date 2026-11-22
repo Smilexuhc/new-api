@@ -3,6 +3,7 @@ package batch
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -101,7 +102,7 @@ func (a *openRouterAdaptor) Submit(ctx context.Context, conn *Connection, req *S
 	}
 	batch, err := parseOpenRouterBatch(data)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrNoUpstreamId, err)
 	}
 	if batch.Id == "" {
 		return nil, ErrNoUpstreamId
@@ -116,6 +117,8 @@ func (a *openRouterAdaptor) Retrieve(ctx context.Context, conn *Connection, upst
 	}
 	return parseOpenRouterBatch(data)
 }
+
+func (a *openRouterAdaptor) SupportsCancel() bool { return false }
 
 func (a *openRouterAdaptor) Cancel(ctx context.Context, conn *Connection, upstreamId string) (*UpstreamBatch, error) {
 	return nil, ErrCancelNotSupported

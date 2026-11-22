@@ -287,7 +287,7 @@ func TestGeminiCancelSucceedsWhenTheFollowUpRetrieveFails(t *testing.T) {
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, ":cancel"):
 			cancels.Add(1)
 			_, _ = w.Write([]byte(`{}`))
-		case r.Method == http.MethodPost:
+		case r.Method == http.MethodPost, cancels.Load() == 0:
 			_, _ = w.Write([]byte(`{"name":"batches/gx","metadata":{"state":"BATCH_STATE_RUNNING"}}`))
 		default:
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -501,37 +501,48 @@ func TestGeminiGroundingIsBilledPerQuery(t *testing.T) {
 	assert.GreaterOrEqual(t, b.Quota, settled.Quota, "the reservation covers the queries")
 }
 
-func TestSubscriptionOverrunFallsToTheWallet(t *testing.T) {
-	resetDB(t)
-	upstream := newFakeUpstream(t)
-	seedBatchChannel(t, 1, constant.ChannelTypeOpenRouter, upstream.server.URL)
-	b, apiErr := create(t, upload(t, testUser, mediaLine("a", testModel, `{"type":"video_url","video_url":{"url":"https://cdn.example.com/1h.mp4"}}`, 200)).FileId)
-	require.Nil(t, apiErr)
-	reserved := b.Quota
+func TestSubscriptionOverrun(t *testing.T) {
+	for _, allowOverflow := range []bool{true, false} {
+		t.Run(fmt.Sprintf("wallet overflow allowed %v", allowOverflow), func(t *testing.T) {
+			resetDB(t)
+			upstream := newFakeUpstream(t)
+			seedBatchChannel(t, 1, constant.ChannelTypeOpenRouter, upstream.server.URL)
+			b, apiErr := create(t, upload(t, testUser, mediaLine("a", testModel, `{"type":"video_url","video_url":{"url":"https://cdn.example.com/1h.mp4"}}`, 200)).FileId)
+			require.Nil(t, apiErr)
+			reserved := b.Quota
 
-	// Move the reservation onto a nearly full subscription.
-	require.NoError(t, model.IncreaseUserQuota(testUser, reserved, true))
-	sub := &model.UserSubscription{Id: 9, UserId: testUser, AmountTotal: int64(reserved) + 1000, AmountUsed: int64(reserved) + 900, Status: "active",
-		StartTime: time.Now().Unix(), EndTime: time.Now().Add(time.Hour).Unix()}
-	require.NoError(t, model.DB.Create(sub).Error)
-	require.NoError(t, model.DB.Model(&model.Batch{}).Where("batch_id = ?", b.BatchId).
-		Updates(map[string]any{"billing_source": "subscription", "subscription_id": 9}).Error)
-	tokenBefore := tokenRemain(t, testToken)
-	logsBefore := logCount(t)
+			// Move the reservation onto a nearly full subscription.
+			require.NoError(t, model.IncreaseUserQuota(testUser, reserved, true))
+			sub := &model.UserSubscription{Id: 9, UserId: testUser, AmountTotal: int64(reserved) + 1000, AmountUsed: int64(reserved) + 900, Status: "active",
+				StartTime: time.Now().Unix(), EndTime: time.Now().Add(time.Hour).Unix(), AllowWalletOverflow: allowOverflow}
+			require.NoError(t, model.DB.Create(sub).Error)
+			require.NoError(t, model.DB.Model(&model.Batch{}).Where("batch_id = ?", b.BatchId).
+				Updates(map[string]any{"billing_source": "subscription", "subscription_id": 9}).Error)
+			tokenBefore := tokenRemain(t, testToken)
+			logsBefore := logCount(t)
 
-	upstream.set(openRouterTerminal("completed", "["+orResult("a", 1_080_000, 150, "vendor/video-1", 0)+"]", "0"))
-	settled := poll(t, b.BatchId)
-	actual := expectedQuota(1_080_000, 150, 0.5)
-	require.Equal(t, actual, settled.Quota)
-	overrun := actual - reserved
+			upstream.set(openRouterTerminal("completed", "["+orResult("a", 1_080_000, 150, "vendor/video-1", 0)+"]", "0"))
+			settled := poll(t, b.BatchId)
+			actual := expectedQuota(1_080_000, 150, 0.5)
+			require.Equal(t, actual, settled.Quota)
+			overrun := actual - reserved
 
-	var reloaded model.UserSubscription
-	require.NoError(t, model.DB.First(&reloaded, 9).Error)
-	assert.Equal(t, reloaded.AmountTotal, reloaded.AmountUsed, "the subscription is charged up to its total")
-	assert.Equal(t, startQuota-(overrun-100), userQuota(t, testUser), "the rest is charged to the wallet")
-	assert.Equal(t, tokenBefore-overrun, tokenRemain(t, testToken))
-	assert.Equal(t, int64(1), logCount(t)-logsBefore)
-	assert.Contains(t, lastLog(t).Other, "wallet_overflow_quota")
+			var reloaded model.UserSubscription
+			require.NoError(t, model.DB.First(&reloaded, 9).Error)
+			assert.Equal(t, reloaded.AmountTotal, reloaded.AmountUsed, "the subscription is charged up to its total")
+			assert.Equal(t, int64(1), logCount(t)-logsBefore)
+			if allowOverflow {
+				assert.Equal(t, startQuota-(overrun-100), userQuota(t, testUser), "the rest is charged to the wallet")
+				assert.Equal(t, tokenBefore-overrun, tokenRemain(t, testToken))
+				assert.Contains(t, lastLog(t).Other, "wallet_overflow_quota")
+				return
+			}
+			assert.Equal(t, startQuota, userQuota(t, testUser), "the wallet is not charged")
+			assert.Equal(t, tokenBefore-100, tokenRemain(t, testToken), "the token is charged what was collected")
+			assert.Equal(t, 100, lastLog(t).Quota)
+			assert.Contains(t, lastLog(t).Other, "uncollected_quota")
+		})
+	}
 }
 
 func TestWalletOverrunIsChargedInFull(t *testing.T) {
@@ -778,4 +789,130 @@ func TestInputFilesPerUserAreLimited(t *testing.T) {
 	assert.Equal(t, http.StatusTooManyRequests, apiErr.Status)
 	_, apiErr = UploadFile(otherUser, otherToken, model.BatchFilePurposeInput, "in.jsonl", []byte(line))
 	assert.Nil(t, apiErr, "the limit is per user")
+}
+
+func TestCancelIsRefusedWhenTheUpstreamStateCannotBeRead(t *testing.T) {
+	resetDB(t)
+	upstream := newFakeUpstream(t)
+	seedBatchChannel(t, 1, constant.ChannelTypeGemini, upstream.server.URL)
+	b, apiErr := create(t, upload(t, testUser, chatLine("a", "x", 10)).FileId)
+	require.Nil(t, apiErr)
+	setRetrieveCode(upstream, http.StatusServiceUnavailable)
+	c, _ := requestContext(testUser, testToken, testTokenKey, http.MethodPost, "/v1/batches/x/cancel")
+	_, cerr := CancelBatch(c, b.BatchId)
+	require.NotNil(t, cerr)
+	assert.Zero(t, upstream.cancels, "a batch that may have finished is not cancelled")
+	assert.Equal(t, model.BatchStatusValidating, reloadBatch(t, b.BatchId).Status)
+}
+
+func TestSubmissionFailures(t *testing.T) {
+	cases := map[string]struct {
+		handler  http.HandlerFunc
+		closed   bool
+		unknown  bool
+		heldCode string
+	}{
+		"rejected by the upstream": {handler: func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"bad request"}}`))
+		}},
+		"upstream unreachable": {closed: true},
+		"answer lost": {unknown: true, handler: func(w http.ResponseWriter, r *http.Request) {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+		}},
+		"gateway timeout": {unknown: true, handler: func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusGatewayTimeout)
+		}},
+		"unreadable acceptance": {unknown: true, handler: func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"id":`))
+		}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			resetDB(t)
+			server := httptest.NewServer(tc.handler)
+			if tc.closed {
+				server.Close()
+			} else {
+				t.Cleanup(server.Close)
+			}
+			seedBatchChannel(t, 1, constant.ChannelTypeOpenRouter, server.URL)
+			_, apiErr := create(t, upload(t, testUser, chatLine("a", "x", 10)).FileId)
+			require.NotNil(t, apiErr)
+
+			var batches []model.Batch
+			require.NoError(t, model.DB.Where("user_id = ?", testUser).Find(&batches).Error)
+			if !tc.unknown {
+				assert.Empty(t, batches, "a submission that never ran leaves no batch")
+				assert.Equal(t, startQuota, userQuota(t, testUser))
+				return
+			}
+			require.Len(t, batches, 1)
+			assert.Equal(t, model.BatchBillingHeld, batches[0].BillingState)
+			assert.Contains(t, batches[0].Errors, "submission_unconfirmed")
+			assert.Equal(t, startQuota-batches[0].Quota, userQuota(t, testUser), "the reservation waits for an administrator")
+		})
+	}
+}
+
+func TestBatchFollowsItsKeyToAnotherChannel(t *testing.T) {
+	resetDB(t)
+	upstream := newFakeUpstream(t)
+	seedBatchChannel(t, 1, constant.ChannelTypeOpenRouter, upstream.server.URL)
+	b, apiErr := create(t, upload(t, testUser, chatLine("a", "x", 10)).FileId)
+	require.Nil(t, apiErr)
+	require.NoError(t, model.DB.Delete(&model.Channel{}, 1).Error)
+	moved := &model.Channel{Id: 2, Type: constant.ChannelTypeOpenRouter, Name: "ch2", Key: "other-key\nkey-1",
+		Status: common.ChannelStatusEnabled, Models: testModel, Group: "default", BaseURL: common.GetPointer(upstream.server.URL)}
+	require.NoError(t, moved.Insert())
+	model.InitChannelCache()
+
+	upstream.set(openRouterTerminal("completed", "["+orResult("a", 1, 1, "m", 0)+"]", "0"))
+	settled := poll(t, b.BatchId)
+	assert.Equal(t, model.BatchBillingSettled, settled.BillingState)
+	assert.Equal(t, expectedQuota(1, 1, 0.5), settled.Quota)
+}
+
+func TestStalledReadDoesNotHoldUpLaterRounds(t *testing.T) {
+	resetDB(t)
+	previous := pollRoundBudget
+	pollRoundBudget = 200 * time.Millisecond
+	t.Cleanup(func() { pollRoundBudget = previous })
+	release := make(chan struct{})
+	var stalledReads atomic.Int32
+	stall := newScriptedUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_, _ = w.Write([]byte(`{"id":"orb-stall","status":"in_progress","request_counts":{"total":1}}`))
+			return
+		}
+		stalledReads.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	t.Cleanup(func() { close(release) })
+	seedBatchChannel(t, 1, constant.ChannelTypeOpenRouter, stall.server.URL)
+	stuck, apiErr := create(t, upload(t, testUser, chatLine("a", "x", 10)).FileId)
+	require.Nil(t, apiErr)
+	require.NoError(t, model.DB.Model(&model.Batch{}).Where("batch_id = ?", stuck.BatchId).Update("next_poll_at", 0).Error)
+
+	started := time.Now()
+	PollOnce(t.Context())
+	assert.Less(t, time.Since(started), 2*time.Second, "the round does not wait for the stalled read")
+	assert.Greater(t, reloadBatch(t, stuck.BatchId).NextPollAt, common.GetTimestamp(), "the stalled batch is claimed")
+
+	healthy := newFakeUpstream(t)
+	seedBatchChannel(t, 2, constant.ChannelTypeOpenRouter, healthy.server.URL)
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", 1).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	require.NoError(t, model.DB.Model(&model.Ability{}).Where("channel_id = ?", 1).Update("enabled", false).Error)
+	model.InitChannelCache()
+	ok, apiErr := create(t, upload(t, testUser, chatLine("b", "y", 10)).FileId)
+	require.Nil(t, apiErr)
+	healthy.set(openRouterTerminal("completed", "["+orResult("b", 1, 1, "m", 0)+"]", "0"))
+	assert.Equal(t, model.BatchBillingSettled, poll(t, ok.BatchId).BillingState)
+	assert.EqualValues(t, 1, stalledReads.Load(), "the claimed batch is not read again")
 }

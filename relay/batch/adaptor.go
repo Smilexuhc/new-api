@@ -127,6 +127,7 @@ type Adaptor interface {
 	SupportsEndpoint(endpoint string) bool
 	Submit(ctx context.Context, conn *Connection, req *SubmitRequest) (*UpstreamBatch, error)
 	Retrieve(ctx context.Context, conn *Connection, upstreamId string) (*UpstreamBatch, error)
+	SupportsCancel() bool
 	// Cancel returns ErrCancelNotSupported when the upstream cannot cancel.
 	Cancel(ctx context.Context, conn *Connection, upstreamId string) (*UpstreamBatch, error)
 	// Delete removes a terminal batch from the upstream.
