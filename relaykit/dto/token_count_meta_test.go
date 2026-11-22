@@ -99,6 +99,26 @@ func TestTokenCountMetaCountsAgentLoopContent(t *testing.T) {
 	}
 }
 
+// A chat video_url part is a URL string or an object with url; both reach
+// converters and token counting.
+func TestChatVideoURLAcceptsStringAndObject(t *testing.T) {
+	var request GeneralOpenAIRequest
+	require.NoError(t, kitutil.UnmarshalJsonStr(`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"compare"},`+
+		`{"type":"video_url","video_url":"https://example.com/a.mp4"},`+
+		`{"type":"video_url","video_url":{"url":"https://example.com/b.mp4"}},`+
+		`{"type":"video_url","video_url":{}}]}]}`, &request))
+
+	parts := request.Messages[0].ParseContent()
+	require.Len(t, parts, 3, "a video_url without url is dropped")
+	assert.Equal(t, "https://example.com/a.mp4", parts[1].GetVideoUrl().Url)
+	assert.Equal(t, "https://example.com/b.mp4", parts[2].GetVideoUrl().Url)
+	meta := request.GetTokenCountMeta()
+	require.Len(t, meta.Files, 2)
+	for _, file := range meta.Files {
+		assert.Equal(t, types.FileTypeVideo, file.FileType)
+	}
+}
+
 // Embedding input can mix bare strings with chat-style parts; text parts count
 // as text and image and video parts as files, like chat message content.
 func TestEmbeddingTokenCountMetaCountsChatStyleParts(t *testing.T) {
