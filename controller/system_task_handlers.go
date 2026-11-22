@@ -7,6 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/batch"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 )
@@ -23,6 +24,7 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
 	service.RegisterSystemTaskHandler(systemTaskCleanupHandler{})
+	service.RegisterSystemTaskHandler(batchPollHandler{})
 }
 
 // systemTaskCleanupHandler deletes, once a day, the finished system tasks
@@ -199,6 +201,26 @@ func (asyncTaskPollHandler) NewPayload() any { return nil }
 func (asyncTaskPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary := service.RunTaskPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
 	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+// batchPollHandler syncs native upstream batches, settles finished ones and
+// deletes expired batch files. It is scheduled only while the batch API is
+// enabled and a batch is unfinished or unsettled.
+type batchPollHandler struct{}
+
+func (batchPollHandler) Type() string { return model.SystemTaskTypeBatchPoll }
+
+func (batchPollHandler) Enabled() bool {
+	return operation_setting.GetBatchSetting().Enabled && model.HasUnfinishedBatches()
+}
+
+func (batchPollHandler) Interval() time.Duration { return 15 * time.Second }
+
+func (batchPollHandler) NewPayload() any { return nil }
+
+func (batchPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	polled := batch.PollOnce(ctx)
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, map[string]any{"polled": polled}, nil)
 }
 
 func finishSystemTaskHandler(task *model.SystemTask, runnerID string, status model.SystemTaskStatus, result any, runErr error) {

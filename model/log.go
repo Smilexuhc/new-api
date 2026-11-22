@@ -425,6 +425,10 @@ type RecordTaskBillingLogParams struct {
 	Group     string
 	Other     *LogOther
 	NodeName  string // 任务发起节点；为空时回退当前节点
+	// PromptTokens and CompletionTokens are optional; batches record the
+	// tokens their settlement is based on.
+	PromptTokens     int
+	CompletionTokens int
 }
 
 func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
@@ -453,6 +457,9 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 		TokenId:   params.TokenId,
 		Group:     params.Group,
 		Other:     other.JSONString(),
+
+		PromptTokens:     params.PromptTokens,
+		CompletionTokens: params.CompletionTokens,
 	}
 	err := createLog(log)
 	if err != nil {

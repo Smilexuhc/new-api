@@ -26,6 +26,7 @@ export const SYSTEM_TASK_TYPE_LABEL: Record<string, string> = {
   midjourney_poll: 'Drawing task polling',
   async_task_poll: 'Async task polling',
   system_task_cleanup: 'Task history cleanup',
+  batch_poll: 'Batch API polling',
   sync_options: 'Settings sync',
   sync_channels: 'Channel sync',
   sync_authz: 'Permission sync',

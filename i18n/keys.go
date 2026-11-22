@@ -120,3 +120,31 @@ const (
 	MsgChannelUpstreamUpdateFailedChannels  = "channel.upstream_update_failed_channels"
 	MsgChannelUpstreamUpdateMoreOmitted     = "channel.upstream_update_more_omitted"
 )
+
+// batch API
+const (
+	MsgBatchInvalidRequest           = "batch.invalid_request"
+	MsgBatchFileRequired             = "batch.file_required"
+	MsgBatchInvalidPurpose           = "batch.invalid_purpose"
+	MsgBatchFileTooLarge             = "batch.file_too_large"
+	MsgBatchFileNotFound             = "batch.file_not_found"
+	MsgBatchFileDownloadForbidden    = "batch.file_download_forbidden"
+	MsgBatchFileInUse                = "batch.file_in_use"
+	MsgBatchInvalidLine              = "batch.invalid_line"
+	MsgBatchTooManyRequests          = "batch.too_many_requests"
+	MsgBatchDuplicateCustomId        = "batch.duplicate_custom_id"
+	MsgBatchMixedModels              = "batch.mixed_models"
+	MsgBatchEmptyFile                = "batch.empty_file"
+	MsgBatchUnsupportedEndpoint      = "batch.unsupported_endpoint"
+	MsgBatchInvalidCompletionWindow  = "batch.invalid_completion_window"
+	MsgBatchInvalidMetadata          = "batch.invalid_metadata"
+	MsgBatchNoChannel                = "batch.no_channel"
+	MsgBatchTieredBillingUnsupported = "batch.tiered_billing_unsupported"
+	MsgBatchInlineTooLarge           = "batch.inline_too_large"
+	MsgBatchUpstreamError            = "batch.upstream_error"
+	MsgBatchNotFound                 = "batch.not_found"
+	MsgBatchCannotCancel             = "batch.cannot_cancel"
+	MsgBatchCancelNotSupported       = "batch.cancel_not_supported"
+	MsgBatchNotDeletable             = "batch.not_deletable"
+	MsgBatchInternalError            = "batch.internal_error"
+)

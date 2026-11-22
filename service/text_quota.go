@@ -397,6 +397,31 @@ func usageSemanticFromUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) 
 	return "openai"
 }
 
+// TextUsagePrice is the charge of one usage under the text pricing rules.
+type TextUsagePrice struct {
+	Quota            int
+	PromptTokens     int
+	CompletionTokens int
+	CacheTokens      int
+	AudioTokens      int
+}
+
+// PriceTextUsage prices usage with the rules PostTextConsumeQuota applies to a
+// synchronous request (cache, image and audio input prices, tool surcharges
+// and the other ratios of relayInfo.PriceData), without moving funds or
+// writing logs. Tiered expression billing is not applied. A saturated
+// conversion is recorded on relayInfo.QuotaClamp.
+func PriceTextUsage(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage) TextUsagePrice {
+	summary := calculateTextQuotaSummary(ctx, relayInfo, effectiveBillingUsage(usage))
+	return TextUsagePrice{
+		Quota:            summary.Quota,
+		PromptTokens:     summary.PromptTokens,
+		CompletionTokens: summary.CompletionTokens,
+		CacheTokens:      summary.CacheTokens,
+		AudioTokens:      summary.AudioTokens,
+	}
+}
+
 func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []*common.Message) {
 	originUsage := usage
 	billingUsage := effectiveBillingUsage(usage)

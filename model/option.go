@@ -246,6 +246,11 @@ func validateOptionValue(key string, value string) error {
 	if err := operation_setting.ValidateEpaySignOption(key, value); err != nil {
 		return err
 	}
+	if operation_setting.IsBatchOption(key) {
+		if err := operation_setting.ValidateBatchOption(key, value); err != nil {
+			return err
+		}
+	}
 	if key == "EmailProvider" || key == "ResendApiKey" || key == "ResendFrom" {
 		if key == "EmailProvider" && value != "smtp" && value != "resend" {
 			return common.NewMessage("Email sending method must be SMTP or Resend")

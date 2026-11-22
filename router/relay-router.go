@@ -167,16 +167,39 @@ func SetRelayRouter(router *gin.Engine) {
 
 		// not implemented
 		httpRouter.POST("/images/variations", controller.RelayNotImplemented)
-		httpRouter.GET("/files", controller.RelayNotImplemented)
-		httpRouter.POST("/files", controller.RelayNotImplemented)
-		httpRouter.DELETE("/files/:id", controller.RelayNotImplemented)
-		httpRouter.GET("/files/:id/content", controller.RelayNotImplemented)
 		httpRouter.POST("/fine-tunes", controller.RelayNotImplemented)
 		httpRouter.GET("/fine-tunes", controller.RelayNotImplemented)
 		httpRouter.GET("/fine-tunes/:id", controller.RelayNotImplemented)
 		httpRouter.POST("/fine-tunes/:id/cancel", controller.RelayNotImplemented)
 		httpRouter.GET("/fine-tunes/:id/events", controller.RelayNotImplemented)
 		httpRouter.DELETE("/models/:model", controller.RelayNotImplemented)
+	}
+
+	{
+		// The batch API serves /v1/files when enabled; disabled, the requests
+		// reach Distribute and the not-implemented handlers as before.
+		filesRouter := relayV1Router.Group("")
+		filesRouter.Use(controller.BatchFilesGate(), middleware.Distribute())
+		filesRouter.GET("/files", controller.RelayNotImplemented)
+		filesRouter.POST("/files", controller.RelayNotImplemented)
+		filesRouter.DELETE("/files/:id", controller.RelayNotImplemented)
+		filesRouter.GET("/files/:id/content", controller.RelayNotImplemented)
+	}
+
+	// Batches are forwarded to upstream native batch APIs. The gate runs
+	// before authentication so a disabled API answers like an unknown route.
+	batchRouter := router.Group("/v1/batches")
+	batchRouter.Use(controller.BatchGate())
+	batchRouter.Use(middleware.RouteTag("relay"))
+	batchRouter.Use(middleware.SystemPerformanceCheck())
+	batchRouter.Use(middleware.TokenAuth())
+	batchRouter.Use(middleware.ModelRequestRateLimit())
+	{
+		batchRouter.POST("", controller.CreateBatch)
+		batchRouter.GET("", controller.ListBatches)
+		batchRouter.GET("/:id", controller.RetrieveBatch)
+		batchRouter.POST("/:id/cancel", controller.CancelBatch)
+		batchRouter.DELETE("/:id", controller.DeleteBatch)
 	}
 
 	relayMjRouter := router.Group("/mj")
