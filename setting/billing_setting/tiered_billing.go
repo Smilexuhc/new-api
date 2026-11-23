@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -53,7 +54,7 @@ func GetBillingMode(model string) string {
 	if mode, ok := billingSetting.BillingMode[model]; ok {
 		return mode
 	}
-	if _, ok := builtinBillingExpr[model]; ok {
+	if _, ok := builtinBillingExprAt(model, time.Now()); ok {
 		// Existing administrator-configured legacy prices take precedence over
 		// a newly introduced built-in expression unless a mode was explicit.
 		if ratio_setting.HasConfiguredModelRatio(model) {
@@ -72,15 +73,13 @@ func GetBillingExpr(model string) (string, bool) {
 		return expr, true
 	}
 	if GetBillingMode(model) == BillingModeTieredExpr {
-		expr, ok := builtinBillingExpr[model]
-		return expr, ok
+		return builtinBillingExprAt(model, time.Now())
 	}
 	return "", false
 }
 
 func GetBuiltinBillingExpr(model string) (string, bool) {
-	expression, ok := builtinBillingExpr[model]
-	return expression, ok
+	return builtinBillingExprAt(model, time.Now())
 }
 
 func PluginBillingExprKey(pluginKey, model string) string {
@@ -160,12 +159,17 @@ func TaskPriceExpr(expression string, overridden, relaysModel bool) bool {
 }
 
 func GetBuiltinBillingExprCopy() map[string]string {
-	return lo.Assign(builtinBillingExpr)
+	now := time.Now()
+	expressions := make(map[string]string, len(builtinBillingExpr)+len(builtinBillingSchedule))
+	for _, model := range builtinBillingModels() {
+		expressions[model], _ = builtinBillingExprAt(model, now)
+	}
+	return expressions
 }
 
 func GetBillingModeCopy() map[string]string {
 	modes := lo.Assign(billingSetting.BillingMode)
-	for model := range builtinBillingExpr {
+	for _, model := range builtinBillingModels() {
 		if _, configured := modes[model]; !configured && GetBillingMode(model) == BillingModeTieredExpr {
 			modes[model] = BillingModeTieredExpr
 		}
@@ -175,7 +179,7 @@ func GetBillingModeCopy() map[string]string {
 
 func GetBillingExprCopy() map[string]string {
 	expressions := lo.Assign(billingSetting.BillingExpr)
-	for model := range builtinBillingExpr {
+	for _, model := range builtinBillingModels() {
 		if _, configured := expressions[model]; configured {
 			continue
 		}

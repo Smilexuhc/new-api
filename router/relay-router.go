@@ -1,6 +1,7 @@
 package router
 
 import (
+	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -8,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
 )
@@ -167,16 +169,43 @@ func SetRelayRouter(router *gin.Engine) {
 
 		// not implemented
 		httpRouter.POST("/images/variations", controller.RelayNotImplemented)
-		httpRouter.GET("/files", controller.RelayNotImplemented)
-		httpRouter.POST("/files", controller.RelayNotImplemented)
-		httpRouter.DELETE("/files/:id", controller.RelayNotImplemented)
-		httpRouter.GET("/files/:id/content", controller.RelayNotImplemented)
 		httpRouter.POST("/fine-tunes", controller.RelayNotImplemented)
 		httpRouter.GET("/fine-tunes", controller.RelayNotImplemented)
 		httpRouter.GET("/fine-tunes/:id", controller.RelayNotImplemented)
 		httpRouter.POST("/fine-tunes/:id/cancel", controller.RelayNotImplemented)
 		httpRouter.GET("/fine-tunes/:id/events", controller.RelayNotImplemented)
 		httpRouter.DELETE("/models/:model", controller.RelayNotImplemented)
+	}
+
+	{
+		// The batch API serves /v1/files when enabled; disabled, the requests
+		// reach Distribute and the not-implemented handlers as before.
+		filesRouter := relayV1Router.Group("")
+		filesRouter.Use(controller.BatchFilesGate(), middleware.Distribute())
+		filesRouter.GET("/files", controller.RelayNotImplemented)
+		filesRouter.POST("/files", controller.RelayNotImplemented)
+		filesRouter.DELETE("/files/:id", controller.RelayNotImplemented)
+		filesRouter.GET("/files/:id/content", controller.RelayNotImplemented)
+	}
+
+	// Batches are forwarded to upstream native batch APIs. The gate runs
+	// before authentication so a disabled API answers like an unknown route:
+	// a plugin route at the same path serves the request, or it is not found.
+	batchRouter := router.Group("/v1/batches")
+	batchRouter.Use(func(c *gin.Context) {
+		if !operation_setting.GetBatchSetting().Enabled {
+			defaultPluginDispatcher.dispatch(c)
+		}
+	})
+	batchRouter.Use(controller.BatchGate())
+	batchRouter.Use(middleware.RouteTag("relay"))
+	batchRouter.Use(middleware.SystemPerformanceCheck())
+	batchRouter.Use(middleware.TokenAuth())
+	// Each route is also registered with a trailing slash, which would
+	// otherwise answer with a redirect even while the API is disabled.
+	for _, route := range batchRoutes {
+		batchRouter.Handle(route.method, route.path, route.handlers...)
+		batchRouter.Handle(route.method, route.path+"/", route.handlers...)
 	}
 
 	relayMjRouter := router.Group("/mj")
@@ -219,6 +248,46 @@ func SetRelayRouter(router *gin.Engine) {
 			controller.Relay(c, types.RelayFormatGemini)
 		})
 	}
+
+	// OpenAI files.retrieve. Offered to plugins first so GET /v1/files/retrieve
+	// still reaches the plugin that owns it. Disabled, an unknown file answers
+	// like an unregistered route, before authentication.
+	router.GET("/v1/files/:id", retrieveBatchFile)
+	router.GET("/v1/files/:id/", retrieveBatchFile)
+}
+
+// retrieveBatchFile serves GET /v1/files/:id. A plugin route at the same path
+// answers first. The writer is restored after a miss: the plugin attempt
+// swaps in a writer that drops a response when no plugin route matches.
+func retrieveBatchFile(c *gin.Context) {
+	writer := c.Writer
+	offerPluginRoute(c)
+	if c.IsAborted() {
+		return
+	}
+	c.Writer = writer
+	if !operation_setting.GetBatchSetting().Enabled {
+		controller.RelayNotFound(c)
+		return
+	}
+	for _, handler := range []gin.HandlerFunc{
+		middleware.RouteTag("relay"),
+		middleware.SystemPerformanceCheck(),
+		middleware.TokenAuth(),
+		middleware.ModelRequestRateLimit(),
+	} {
+		handler(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+	controller.RetrieveBatchFile(c)
+}
+
+// offerPluginRoute gives a handoff route to the active plugin generation.
+// Tests that build their own generation replace it for the duration of the test.
+var offerPluginRoute = func(c *gin.Context) {
+	defaultPluginDispatcher.dispatch(c)
 }
 
 func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {
@@ -242,4 +311,20 @@ func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {
 		relayMjRouter.POST("/insight-face/swap", controller.RelayMidjourney)
 		relayMjRouter.POST("/submit/upload-discord-images", controller.RelayMidjourney)
 	}
+}
+
+type batchRoute struct {
+	method   string
+	path     string
+	handlers []gin.HandlerFunc
+}
+
+// batchRoutes are the /v1/batches routes. Only creating a batch counts as a
+// model request; polling does not.
+var batchRoutes = []batchRoute{
+	{http.MethodPost, "", []gin.HandlerFunc{middleware.ModelRequestRateLimit(), controller.CreateBatch}},
+	{http.MethodGet, "", []gin.HandlerFunc{controller.ListBatches}},
+	{http.MethodGet, "/:id", []gin.HandlerFunc{controller.RetrieveBatch}},
+	{http.MethodPost, "/:id/cancel", []gin.HandlerFunc{controller.CancelBatch}},
+	{http.MethodDelete, "/:id", []gin.HandlerFunc{controller.DeleteBatch}},
 }

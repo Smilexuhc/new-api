@@ -397,6 +397,55 @@ func usageSemanticFromUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) 
 	return "openai"
 }
 
+// TextUsagePrice is the charge of one usage under the text pricing rules.
+type TextUsagePrice struct {
+	Quota            int
+	PromptTokens     int
+	CompletionTokens int
+	CacheTokens      int
+	AudioTokens      int
+}
+
+// PriceTextUsage prices usage with the rules PostTextConsumeQuota applies to a
+// synchronous request, without moving funds or writing logs: the expression
+// of relayInfo.TieredBillingSnapshot when there is one, otherwise the cache,
+// image and audio input prices, plus tool surcharges. The other ratios of
+// relayInfo.PriceData scale the price in both modes, but not the surcharges.
+// A saturated conversion is recorded on relayInfo.QuotaClamp; an expression
+// that fails to evaluate returns an error.
+func PriceTextUsage(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage) (TextUsagePrice, error) {
+	billingUsage := effectiveBillingUsage(usage)
+	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
+	price := TextUsagePrice{
+		Quota:            summary.Quota,
+		PromptTokens:     summary.PromptTokens,
+		CompletionTokens: summary.CompletionTokens,
+		CacheTokens:      summary.CacheTokens,
+		AudioTokens:      summary.AudioTokens,
+	}
+	snap := relayInfo.TieredBillingSnapshot
+	if snap == nil || snap.BillingMode != "tiered_expr" || billingUsage == nil {
+		return price, nil
+	}
+	usedVars := billingexpr.UsedVarsByHash(snap.ExprString, snap.ExprHash)
+	params := BuildTieredTokenParams(billingUsage, summary.IsClaudeUsageSemantic, usedVars)
+	requestInput := billingexpr.RequestInput{}
+	if relayInfo.BillingRequestInput != nil {
+		requestInput = *relayInfo.BillingRequestInput
+	}
+	result, err := billingexpr.ComputeTieredQuotaWithRequest(snap, params, requestInput)
+	if err != nil {
+		return price, err
+	}
+	quota := relayInfo.PriceData.ApplyOtherRatiosToDecimal(
+		decimal.NewFromFloat(result.ActualQuotaBeforeGroup).Mul(decimal.NewFromFloat(snap.GroupRatio)),
+	).Add(summary.ToolCallSurchargeQuota)
+	var clamp *common.QuotaClamp
+	price.Quota, clamp = common.QuotaFromDecimalChecked(quota)
+	noteQuotaClamp(relayInfo, clamp)
+	return price, nil
+}
+
 func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []*common.Message) {
 	originUsage := usage
 	billingUsage := effectiveBillingUsage(usage)

@@ -153,6 +153,51 @@ func TestImageModelBuiltinPricesAndOverrides(t *testing.T) {
 	}
 }
 
+// Gemini built-in prices are on by default for new model names and yield to
+// an administrator's expression, mode, ratio or per-call price.
+func TestGeminiBuiltinBillingOverrides(t *testing.T) {
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	saved := *settings
+	savedRatios, savedPrices := ratio_setting.ModelRatio2JSONString(), ratio_setting.ModelPrice2JSONString()
+	t.Cleanup(func() {
+		*settings = saved
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatios))
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrices))
+	})
+	for _, name := range []string{"gemini-4-carbon", "gemini-4-argon", "gemini-4-neon", "gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.1-flash-lite"} {
+		t.Run(name, func(t *testing.T) {
+			*settings = billing_setting.BillingSetting{BillingMode: map[string]string{}, BillingExpr: map[string]string{}}
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{}`))
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+			assert.Equal(t, billing_setting.BillingModeTieredExpr, billing_setting.GetBillingMode(name))
+			builtin, ok := billing_setting.GetBillingExpr(name)
+			require.True(t, ok)
+			assert.Equal(t, builtin, billing_setting.GetBuiltinBillingExprCopy()[name])
+			assert.Equal(t, builtin, billing_setting.GetBillingExprCopy()[name])
+			assert.Equal(t, billing_setting.BillingModeTieredExpr, billing_setting.GetBillingModeCopy()[name])
+
+			settings.BillingExpr[name] = `tier("custom", p * 7)`
+			actual, ok := billing_setting.GetBillingExpr(name)
+			require.True(t, ok)
+			assert.Equal(t, `tier("custom", p * 7)`, actual)
+
+			*settings = billing_setting.BillingSetting{BillingMode: map[string]string{name: "ratio"}, BillingExpr: map[string]string{}}
+			assert.Equal(t, "ratio", billing_setting.GetBillingMode(name))
+			_, ok = billing_setting.GetBillingExpr(name)
+			assert.False(t, ok)
+
+			*settings = billing_setting.BillingSetting{BillingMode: map[string]string{}, BillingExpr: map[string]string{}}
+			encoded, err := common.Marshal(map[string]float64{name: 1})
+			require.NoError(t, err)
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(string(encoded)))
+			assert.Equal(t, "ratio", billing_setting.GetBillingMode(name))
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{}`))
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(encoded)))
+			assert.Equal(t, "ratio", billing_setting.GetBillingMode(name))
+		})
+	}
+}
+
 // DeepSeek prices are peak/off-peak expressions in USD per 1M tokens; peak is
 // twice off-peak. The same usage settles to the same quota from a Chat,
 // Responses or Anthropic response, and the Search/Fetch routing names cost

@@ -49,6 +49,28 @@ func TestSystemTaskListFiltersAndPaginationResponse(t *testing.T) {
 	assert.Equal(t, "older", response.Data[0].TaskID)
 }
 
+// Batch polling runs whether or not the batch endpoints are enabled, so
+// batches submitted before they were disabled still settle and expired files
+// are still removed.
+func TestBatchPollRunsWhileReservationsOrExpiredFilesRemain(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&model.Batch{}, &model.BatchFile{}))
+	now := common.GetTimestamp()
+	handler := batchPollHandler{}
+
+	assert.False(t, handler.Enabled())
+	require.NoError(t, db.Create(&model.Batch{BatchId: "batch_done", Status: model.BatchStatusFailed, BillingState: model.BatchBillingReserved}).Error)
+	assert.True(t, handler.Enabled(), "a failed batch with a reservation still needs settling")
+	require.NoError(t, db.Model(&model.Batch{}).Where("batch_id = ?", "batch_done").Update("billing_state", model.BatchBillingSettled).Error)
+	assert.False(t, handler.Enabled())
+	require.NoError(t, db.Create(&model.BatchFile{FileId: "file_old", Content: []byte("x"), ExpiresAt: now - 1}).Error)
+	assert.True(t, handler.Enabled(), "an expired file still needs removing")
+}
+
 func TestSystemTaskInvalidFiltersAreRejected(t *testing.T) {
 	for _, tc := range []struct {
 		query   string

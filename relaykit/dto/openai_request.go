@@ -650,6 +650,19 @@ type MessageVideoUrl struct {
 	Url string `json:"url"`
 }
 
+// videoURLOf reads a video_url part, which is a URL string or, as in the
+// OpenAI-compatible form, an object with url.
+func videoURLOf(value any) (string, bool) {
+	switch v := value.(type) {
+	case string:
+		return v, v != ""
+	case map[string]any:
+		url, ok := v["url"].(string)
+		return url, ok && url != ""
+	}
+	return "", false
+}
+
 const (
 	ContentTypeText       = "text"
 	ContentTypeImageURL   = "image_url"
@@ -863,7 +876,7 @@ func (m *Message) ParseContent() []MediaContent {
 				}
 			}
 		case ContentTypeVideoUrl:
-			if videoUrl, ok := contentItem["video_url"].(string); ok {
+			if videoUrl, ok := videoURLOf(contentItem["video_url"]); ok {
 				contentList = append(contentList, MediaContent{
 					Type: ContentTypeVideoUrl,
 					VideoUrl: &MessageVideoUrl{
@@ -1036,7 +1049,7 @@ func (m *Message) ParseContent() []MediaContent {
 					}
 				}
 			case ContentTypeVideoUrl:
-				if videoUrl, ok := contentItem["video_url"].(string); ok {
+				if videoUrl, ok := videoURLOf(contentItem["video_url"]); ok {
 					contentList = append(contentList, MediaContent{
 						Type: ContentTypeVideoUrl,
 						VideoUrl: &MessageVideoUrl{

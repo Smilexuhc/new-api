@@ -132,6 +132,10 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 			continue
 		}
 
+		// 视频按固定 token 计，类型已知时不下载
+		if file.FileType == types.FileTypeVideo {
+			continue
+		}
 		// 如果文件类型未知且需要获取，通过 MIME 类型检测
 		if file.FileType == "" || (file.Source.IsURL() && shouldFetchFiles) {
 			// 注意：这里我们直接调用 LoadFileSource 而不是 GetMimeType

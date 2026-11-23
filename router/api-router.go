@@ -186,6 +186,12 @@ func SetApiRouter(router *gin.Engine) {
 			subscriptionRoute.POST("/creem/pay", middleware.CriticalRateLimit(), controller.SubscriptionRequestCreemPay)
 			subscriptionRoute.POST("/waffo-pancake/pay", middleware.CriticalRateLimit(), controller.SubscriptionRequestWaffoPancakePay)
 		}
+		batchAdminRoute := apiRouter.Group("/batch/admin")
+		batchAdminRoute.Use(middleware.AdminAuth())
+		{
+			batchAdminRoute.GET("/held", controller.AdminListHeldBatches)
+			batchAdminRoute.POST("/held/:id/resolve", controller.AdminResolveHeldBatch)
+		}
 		subscriptionAdminRoute := apiRouter.Group("/subscription/admin")
 		subscriptionAdminRoute.Use(middleware.AdminAuth())
 		{

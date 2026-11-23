@@ -111,40 +111,47 @@ func resolveTokenKey(ctx context.Context, tokenId int, taskID string) string {
 	return token.Key
 }
 
-// taskIsSubscription 判断任务是否通过订阅计费。
-func taskIsSubscription(task *model.Task) bool {
-	return task.PrivateData.BillingSource == BillingSourceSubscription && task.PrivateData.SubscriptionId > 0
-}
-
 // taskAdjustFunding 调整任务的资金来源（钱包或订阅），delta > 0 表示扣费，delta < 0 表示退还。
 func taskAdjustFunding(task *model.Task, delta int) error {
-	if taskIsSubscription(task) {
-		return model.PostConsumeUserSubscriptionDelta(task.PrivateData.SubscriptionId, int64(delta))
+	return AdjustAsyncFunding(task.UserId, task.PrivateData.BillingSource, task.PrivateData.SubscriptionId, delta)
+}
+
+// AdjustAsyncFunding 调整异步计费（任务、batch）在提交时确定的资金来源，
+// delta > 0 表示补扣，delta < 0 表示退还。
+func AdjustAsyncFunding(userId int, billingSource string, subscriptionId int, delta int) error {
+	if billingSource == BillingSourceSubscription && subscriptionId > 0 {
+		return model.PostConsumeUserSubscriptionDelta(subscriptionId, int64(delta))
 	}
 	if delta > 0 {
-		return model.DecreaseUserQuota(task.UserId, delta, false)
+		return model.DecreaseUserQuota(userId, delta, false)
 	}
-	return model.IncreaseUserQuota(task.UserId, -delta, false)
+	return model.IncreaseUserQuota(userId, -delta, false)
 }
 
 // taskAdjustTokenQuota 调整任务的令牌额度，delta > 0 表示扣费，delta < 0 表示退还。
 // 需要通过 resolveTokenKey 运行时获取 key（不从 PrivateData 中读取）。
 func taskAdjustTokenQuota(ctx context.Context, task *model.Task, delta int) {
-	if task.PrivateData.TokenId <= 0 || delta == 0 {
+	AdjustAsyncTokenQuota(ctx, task.PrivateData.TokenId, task.TaskID, delta)
+}
+
+// AdjustAsyncTokenQuota 调整异步计费的令牌额度，delta > 0 表示扣费，delta < 0 表示退还。
+// ref 只用于日志（任务 ID 或 batch ID）。
+func AdjustAsyncTokenQuota(ctx context.Context, tokenId int, ref string, delta int) {
+	if tokenId <= 0 || delta == 0 {
 		return
 	}
-	tokenKey := resolveTokenKey(ctx, task.PrivateData.TokenId, task.TaskID)
+	tokenKey := resolveTokenKey(ctx, tokenId, ref)
 	if tokenKey == "" {
 		return
 	}
 	var err error
 	if delta > 0 {
-		err = model.DecreaseTokenQuota(task.PrivateData.TokenId, tokenKey, delta)
+		err = model.DecreaseTokenQuota(tokenId, tokenKey, delta)
 	} else {
-		err = model.IncreaseTokenQuota(task.PrivateData.TokenId, tokenKey, -delta)
+		err = model.IncreaseTokenQuota(tokenId, tokenKey, -delta)
 	}
 	if err != nil {
-		logger.LogWarn(ctx, common.LogText("failed to adjust token quota (delta=%d, task=%s): %s", delta, task.TaskID, err.Error()))
+		logger.LogWarn(ctx, common.LogText("failed to adjust token quota (delta=%d, ref=%s): %s", delta, ref, err.Error()))
 	}
 }
 
