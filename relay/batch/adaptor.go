@@ -100,6 +100,15 @@ func (r *UpstreamResult) Succeeded() bool {
 type UpstreamError struct {
 	StatusCode int
 	Message    string
+	// KeyRejected is set when the upstream refused the channel's key: a 401,
+	// or the "API key not valid" answer some upstreams give with another code.
+	KeyRejected bool
+}
+
+// channelFault reports whether the error is about the channel's credentials
+// or permissions rather than the request.
+func (e *UpstreamError) channelFault() bool {
+	return e.KeyRejected || e.StatusCode == 401 || e.StatusCode == 403
 }
 
 func (e *UpstreamError) Error() string {

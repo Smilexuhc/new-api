@@ -233,19 +233,10 @@ func tokenAllowsModel(c *gin.Context, modelName string) bool {
 // selectBatchChannel picks a channel of the user group that serves the model
 // and whose type has a native batch adaptor, and loads its context (key,
 // base URL, model mapping) like the relay distributor does.
-func selectBatchChannel(c *gin.Context, modelName string) (*model.Channel, Adaptor, *Error) {
+func selectBatchChannel(c *gin.Context, modelName string, retry *service.RetryParam) (*model.Channel, Adaptor, *Error) {
 	group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	noChannel := newError(http.StatusServiceUnavailable, "no_batch_channel", i18n.MsgBatchNoChannel, map[string]any{"Group": group, "Model": modelName})
-	service.GetChannelConstraints(c).AddFilter(taskdto.ChannelFilter{
-		Kind:         taskdto.FilterChannelTypes,
-		ChannelTypes: SupportedChannelTypes(),
-	})
-	channel, _, selectErr := service.SelectChannelForRequest(c, modelName, &service.RetryParam{
-		Ctx:        c,
-		ModelName:  modelName,
-		TokenGroup: group,
-		Retry:      common.GetPointer(0),
-	})
+	channel, _, selectErr := service.SelectChannelForRequest(c, modelName, retry)
 	if selectErr != nil || channel == nil {
 		return nil, nil, noChannel
 	}
@@ -256,7 +247,17 @@ func selectBatchChannel(c *gin.Context, modelName string) (*model.Channel, Adapt
 	if apiErr := middleware.SetupContextForSelectedChannel(c, channel, modelName); apiErr != nil {
 		return nil, nil, &Error{Status: http.StatusServiceUnavailable, Code: "no_batch_channel", Message: apiErr.Error()}
 	}
+	service.AppendUsedChannel(c, channel.Id)
 	return channel, adaptor, nil
+}
+
+// restrictToBatchChannels keeps the channel selection to types with a native
+// batch adaptor.
+func restrictToBatchChannels(c *gin.Context) {
+	service.GetChannelConstraints(c).AddFilter(taskdto.ChannelFilter{
+		Kind:         taskdto.FilterChannelTypes,
+		ChannelTypes: SupportedChannelTypes(),
+	})
 }
 
 func batchRatioFor(adaptor Adaptor) (float64, string) {
@@ -296,26 +297,76 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		return nil, &Error{Status: http.StatusForbidden, Code: "model_not_allowed", Message: i18n.T(c, i18n.MsgDistributorTokenModelForbidden, map[string]any{"Model": modelName})}
 	}
 
-	channel, adaptor, apiErr := selectBatchChannel(c, modelName)
+	// Channel failures are handled as the synchronous relay does: an upstream
+	// rejection that the shared retry policy accepts is retried on the next
+	// channel or key, and the failing channel or key is disabled when the
+	// channel allows it. A submission whose outcome is unknown is never
+	// retried, since the upstream may already run it.
+	restrictToBatchChannels(c)
+	retry := &service.RetryParam{
+		Ctx:        c,
+		ModelName:  modelName,
+		TokenGroup: common.GetContextKeyString(c, constant.ContextKeyUsingGroup),
+		Retry:      common.GetPointer(0),
+	}
+	var last *Error
+	for ; retry.GetRetry() <= common.RetryTimes; retry.IncreaseRetry() {
+		batch, apiErr, rejected := createBatchOnce(c, req, file, lines, modelName, retry)
+		if rejected == nil {
+			if apiErr != nil {
+			}
+			if apiErr != nil && apiErr.Code == "no_batch_channel" && last != nil {
+				// Nothing is left to retry on; the last real failure is the answer.
+				return nil, last
+			}
+			return batch, apiErr
+		}
+		last = apiErr
+		decision := service.DecideRelayRetry(c, rejected.err, common.RetryTimes-retry.GetRetry())
+		service.RecordPolicyFailure(c, rejected.channel.Id, rejected.err, decision)
+		service.ProcessChannelError(c, *types.NewChannelError(rejected.channel.Id, rejected.channel.Type, rejected.channel.Name,
+			rejected.channel.ChannelInfo.IsMultiKey, rejected.key, rejected.channel.GetAutoBan()), rejected.err, rejected.info)
+		if decision.Action != "retry" {
+			break
+		}
+	}
+	return nil, last
+}
+
+// submitRejection is a submission the upstream refused before creating
+// anything: its record and reservation are already released.
+type submitRejection struct {
+	err     *types.NewAPIError
+	channel *model.Channel
+	key     string
+	info    *relaycommon.RelayInfo
+}
+
+// createBatchOnce makes one attempt on the channel the retry state selects.
+// The third result is set only for a rejected submission that may be retried.
+func createBatchOnce(c *gin.Context, req *CreateRequest, file *model.BatchFile, lines []*inputLine, modelName string, retry *service.RetryParam) (*model.Batch, *Error, *submitRejection) {
+	userId := c.GetInt("id")
+	setting := operation_setting.GetBatchSetting()
+	channel, adaptor, apiErr := selectBatchChannel(c, modelName, retry)
 	if apiErr != nil {
-		return nil, apiErr
+		return nil, apiErr, nil
 	}
 	if !adaptor.SupportsEndpoint(req.Endpoint) {
-		return nil, newError(http.StatusBadRequest, "invalid_request_error", i18n.MsgBatchUnsupportedEndpoint, map[string]any{"Endpoint": req.Endpoint})
+		return nil, newError(http.StatusBadRequest, "invalid_request_error", i18n.MsgBatchUnsupportedEndpoint, map[string]any{"Endpoint": req.Endpoint}), nil
 	}
 
 	info := relaycommon.GenRelayInfoOpenAI(c, nil)
 	info.OriginModelName = modelName
 	info.InitChannelMeta(c)
 	if err := helper.ModelMappedHelper(c, info, nil); err != nil {
-		return nil, internalError(err)
+		return nil, internalError(err), nil
 	}
 	// An expression reads request parameters; the create call carries none,
 	// so the price check runs on the first request instead.
 	info.BillingRequestInput = &billingexpr.RequestInput{Body: lines[0].RawBody}
 	priceData, err := helper.ModelPriceHelper(c, info, 0, &types.TokenCountMeta{})
 	if err != nil {
-		return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}
+		return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}, nil
 	}
 	info.PriceData = priceData
 	ratio, ratioSource := batchRatioFor(adaptor)
@@ -336,11 +387,11 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 	remoteMedia := 0
 	for _, line := range lines {
 		if err := line.checkUpstreamFields(channel.Type); err != nil {
-			return nil, lineError(line.Line, err.Error())
+			return nil, lineError(line.Line, err.Error()), nil
 		}
 		body, err := line.upstreamBody(info.UpstreamModelName, setting.DefaultMaxOutputTokens)
 		if err != nil {
-			return nil, lineError(line.Line, err.Error())
+			return nil, lineError(line.Line, err.Error()), nil
 		}
 		if converts {
 			remoteMedia += remoteMediaCount(body)
@@ -348,7 +399,7 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		bodies = append(bodies, body)
 	}
 	if remoteMedia > maxRemoteMediaPerBatch {
-		return nil, newError(http.StatusBadRequest, "invalid_request_error", i18n.MsgBatchTooManyRemoteMedia, map[string]any{"Max": maxRemoteMediaPerBatch})
+		return nil, newError(http.StatusBadRequest, "invalid_request_error", i18n.MsgBatchTooManyRemoteMedia, map[string]any{"Max": maxRemoteMediaPerBatch}), nil
 	}
 
 	// The reservation is taken before any linked media is downloaded, so a
@@ -356,12 +407,12 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 	// reserved once its size is known.
 	_, preConsume, clamp, err := estimateChargesOf(c, snapshot, lines, bodies, converts)
 	if err != nil {
-		return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}
+		return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}, nil
 	}
 	info.PriceData.AddOtherRatio(batchRatioKey, ratio)
 	info.ForcePreConsume = true
 	if apiErr := service.PreConsumeBilling(c, preConsume, info); apiErr != nil {
-		return nil, billingErrorFrom(apiErr)
+		return nil, billingErrorFrom(apiErr), nil
 	}
 	refund := func() {
 		if info.Billing != nil {
@@ -378,19 +429,19 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 			var request dto.GeneralOpenAIRequest
 			if err := common.Unmarshal(bodies[index], &request); err != nil {
 				refund()
-				return nil, lineError(line.Line, err.Error())
+				return nil, lineError(line.Line, err.Error()), nil
 			}
 			body, err := converter.ConvertRequest(c, info, &request)
 			if err != nil {
 				refund()
 				if isDownloadBudgetError(err) {
-					return nil, submitError(ErrGeminiInlineTooLarge)
+					return nil, submitError(ErrGeminiInlineTooLarge), nil
 				}
-				return nil, lineError(line.Line, err.Error())
+				return nil, lineError(line.Line, err.Error()), nil
 			}
 			if inlineBytes += len(body); inlineBytes > GeminiInlineRequestLimit {
 				refund()
-				return nil, submitError(ErrGeminiInlineTooLarge)
+				return nil, submitError(ErrGeminiInlineTooLarge), nil
 			}
 			bodies[index] = body
 		}
@@ -398,12 +449,12 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 		_, converted, convertedClamp, err := estimateCharges(c, snapshot, lines, bodies)
 		if err != nil {
 			refund()
-			return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}
+			return nil, &Error{Status: http.StatusBadRequest, Code: "model_price_error", Message: err.Error()}, nil
 		}
 		if converted > preConsume {
 			if apiErr := service.PreConsumeBilling(c, converted, info); apiErr != nil {
 				refund()
-				return nil, billingErrorFrom(apiErr)
+				return nil, billingErrorFrom(apiErr), nil
 			}
 			preConsume, clamp = converted, convertedClamp
 		}
@@ -416,12 +467,12 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 	batchId, err := newObjectId("batch_")
 	if err != nil {
 		refund()
-		return nil, internalError(err)
+		return nil, internalError(err), nil
 	}
 	snapshotJSON, err := common.Marshal(snapshot)
 	if err != nil {
 		refund()
-		return nil, internalError(err)
+		return nil, internalError(err), nil
 	}
 	metadataJSON := ""
 	if len(req.Metadata) > 0 {
@@ -461,7 +512,7 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 	// leaves a record that the poller settles instead of a lost reservation.
 	if err := model.CreateBatch(b); err != nil {
 		refund()
-		return nil, internalError(err)
+		return nil, internalError(err), nil
 	}
 	// From here the record owns the reservation: every refund goes through
 	// its switch out of reserved, so a refund cannot happen twice.
@@ -494,7 +545,7 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 			map[string]any{"submission_unrecorded": false}) {
 			recordSubmission(c, info, b, ratio, ratioSource, clamp)
 		}
-		return nil, submitError(err)
+		return nil, submitError(err), nil
 	}
 	if err != nil {
 		// The client gets an error and no batch id, so the record goes too.
@@ -502,8 +553,11 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 			if deleteErr := model.DeleteUnsubmittedBatch(batchId); deleteErr != nil {
 				logger.LogWarn(c, common.LogText("batch %s: failed to delete the record of a rejected submission: %s", batchId, deleteErr.Error()))
 			}
+			// The upstream created nothing and the reservation is back, so the
+			// next channel can take the batch.
+			return nil, submitError(err), &submitRejection{err: submissionRelayError(err), channel: channel, key: key, info: info}
 		}
-		return nil, submitError(err)
+		return nil, submitError(err), nil
 	}
 
 	updates := map[string]any{
@@ -528,15 +582,15 @@ func CreateBatch(c *gin.Context, req *CreateRequest) (*model.Batch, *Error) {
 			logger.LogError(c, common.LogText("batch %s: failed to cancel upstream batch %s: %s", batchId, upstream.Id, cancelErr.Error()))
 		}
 		retrySubmissionSave(batchId, upstream.Id, b.CreatedAt, updates)
-		return nil, internalError(err)
+		return nil, internalError(err), nil
 	}
 	recordSubmission(c, info, b, ratio, ratioSource, clamp)
 
 	fresh, err := model.GetBatch(userId, batchId)
 	if err != nil {
-		return b, nil
+		return b, nil, nil
 	}
-	return fresh, nil
+	return fresh, nil, nil
 }
 
 func isDownloadBudgetError(err error) bool {
@@ -636,6 +690,12 @@ func submitError(err error) *Error {
 	}
 	var upstreamErr *UpstreamError
 	if errors.As(err, &upstreamErr) {
+		if upstreamErr.channelFault() {
+			// The channel's own credentials failed. That is not the caller's
+			// doing and not something the caller can fix, so it is a gateway
+			// error without the upstream's wording.
+			return newError(http.StatusBadGateway, "upstream_error", i18n.MsgBatchUpstreamError, map[string]any{"Message": "the upstream channel is unavailable"})
+		}
 		status := http.StatusBadGateway
 		if upstreamErr.StatusCode >= 400 && upstreamErr.StatusCode < 500 {
 			status = upstreamErr.StatusCode
@@ -846,7 +906,26 @@ func upstreamDeadline(b *model.Batch) int64 {
 
 func isUpstreamAuthError(err error) bool {
 	var upstreamErr *UpstreamError
-	return errors.As(err, &upstreamErr) && (upstreamErr.StatusCode == http.StatusUnauthorized || upstreamErr.StatusCode == http.StatusForbidden)
+	return errors.As(err, &upstreamErr) && upstreamErr.channelFault()
+}
+
+// submissionRelayError expresses a rejected submission in the error type of
+// the synchronous relay, so the shared retry and disable policy applies to it.
+// A key the upstream rejects is a channel error, which is always retried on
+// another channel or key and disables the key it used.
+func submissionRelayError(err error) *types.NewAPIError {
+	var upstreamErr *UpstreamError
+	if errors.As(err, &upstreamErr) {
+		if upstreamErr.KeyRejected {
+			return types.NewErrorWithStatusCode(errors.New(upstreamErr.Message), types.ErrorCodeChannelInvalidKey, upstreamErr.StatusCode)
+		}
+		return types.WithOpenAIError(types.OpenAIError{
+			Message: upstreamErr.Message,
+			Type:    "upstream_error",
+			Code:    string(types.ErrorCodeBadResponseStatusCode),
+		}, upstreamErr.StatusCode)
+	}
+	return types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 }
 
 func refreshBatch(ctx context.Context, b *model.Batch, now int64) {

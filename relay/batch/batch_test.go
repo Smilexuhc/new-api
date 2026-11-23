@@ -108,8 +108,10 @@ type fakeUpstream struct {
 	submits      int
 	lastSubmit   []byte
 	submitStatus int
+	submitBody   string
 	retrieve     string
 	retrieveCode int
+	retrieveBody string
 	cancels      int
 	deletes      int
 }
@@ -139,7 +141,11 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		f.lastSubmit = body
 		if f.submitStatus != 0 {
 			w.WriteHeader(f.submitStatus)
-			_, _ = w.Write([]byte(`{"error":{"message":"upstream rejected the batch"}}`))
+			body := f.submitBody
+			if body == "" {
+				body = `{"error":{"message":"upstream rejected the batch"}}`
+			}
+			_, _ = w.Write([]byte(body))
 			return
 		}
 		if path == "/v1/batches" {
@@ -153,7 +159,11 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet:
 		if f.retrieveCode != 0 {
 			w.WriteHeader(f.retrieveCode)
-			_, _ = w.Write([]byte(`{"error":{"message":"not found"}}`))
+			body := f.retrieveBody
+			if body == "" {
+				body = `{"error":{"message":"not found"}}`
+			}
+			_, _ = w.Write([]byte(body))
 			return
 		}
 		_, _ = w.Write([]byte(f.retrieve))
@@ -201,6 +211,14 @@ func seedBatchChannel(t *testing.T, id int, channelType int, baseURL string) {
 	t.Helper()
 	channel := &model.Channel{Id: id, Type: channelType, Name: fmt.Sprintf("ch%d", id), Key: fmt.Sprintf("key-%d", id),
 		Status: common.ChannelStatusEnabled, Models: testModel, Group: "default", BaseURL: &baseURL}
+	require.NoError(t, channel.Insert())
+	model.InitChannelCache()
+}
+
+func seedPrioritizedChannel(t *testing.T, id int, baseURL string, priority int64, autoBan int) {
+	t.Helper()
+	channel := &model.Channel{Id: id, Type: constant.ChannelTypeOpenRouter, Name: fmt.Sprintf("ch%d", id), Key: fmt.Sprintf("key-%d", id),
+		Status: common.ChannelStatusEnabled, Models: testModel, Group: "default", BaseURL: &baseURL, Priority: &priority, AutoBan: &autoBan}
 	require.NoError(t, channel.Insert())
 	model.InitChannelCache()
 }
@@ -732,6 +750,177 @@ func TestBatchRejectedSubmissionRefundsAndLeavesNoRecord(t *testing.T) {
 	var count int64
 	require.NoError(t, model.DB.Model(&model.Batch{}).Count(&count).Error)
 	assert.Zero(t, count)
+}
+
+// ---------------------------------------------------------------------------
+// Channel failures at submission follow the synchronous relay
+// ---------------------------------------------------------------------------
+
+// withRetries sets the administrator's retry budget, which is 0 by default.
+func withRetries(t *testing.T, times int) {
+	t.Helper()
+	previous := common.RetryTimes
+	common.RetryTimes = times
+	t.Cleanup(func() { common.RetryTimes = previous })
+}
+
+func batchCount(t *testing.T) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, model.DB.Model(&model.Batch{}).Count(&count).Error)
+	return count
+}
+
+func TestBatchSubmissionMovesToTheNextChannelWhenTheKeyIsRejected(t *testing.T) {
+	for name, rejected := range map[string]struct {
+		status int
+		body   string
+	}{
+		"unauthorized":         {http.StatusUnauthorized, ""},
+		"google key not valid": {http.StatusBadRequest, `{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}`},
+		"google key expired":   {http.StatusBadRequest, `{"error":{"code":400,"message":"API key expired. Please renew the API key.","status":"INVALID_ARGUMENT"}}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			withRetries(t, 2)
+			resetDB(t)
+			broken, healthy := newFakeUpstream(t), newFakeUpstream(t)
+			broken.submitStatus, broken.submitBody = rejected.status, rejected.body
+			seedPrioritizedChannel(t, 1, broken.server.URL, 10, 1)
+			seedPrioritizedChannel(t, 2, healthy.server.URL, 0, 1)
+			file := upload(t, testUser, chatLine("a", "x", 10))
+			b, apiErr := create(t, file.FileId)
+			require.Nil(t, apiErr)
+			assert.Equal(t, 2, b.ChannelId, "the batch runs on the channel that accepted it")
+			assert.Equal(t, 1, broken.submits)
+			assert.Equal(t, 1, healthy.submits)
+			assert.EqualValues(t, 1, batchCount(t), "the rejected attempt leaves no record")
+			require.Eventually(t, func() bool { return userQuota(t, testUser) == startQuota-b.Quota }, 2*time.Second, 20*time.Millisecond, "the user pays once")
+		})
+	}
+}
+
+func TestBatchSubmissionDisablesTheChannelWhoseKeyIsRejected(t *testing.T) {
+	withRetries(t, 2)
+	previous := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+	resetDB(t)
+	broken, healthy := newFakeUpstream(t), newFakeUpstream(t)
+	broken.submitStatus = http.StatusUnauthorized
+	seedPrioritizedChannel(t, 1, broken.server.URL, 10, 1)
+	seedPrioritizedChannel(t, 2, healthy.server.URL, 0, 1)
+	file := upload(t, testUser, chatLine("a", "x", 10))
+	_, apiErr := create(t, file.FileId)
+	require.Nil(t, apiErr)
+	require.Eventually(t, func() bool {
+		channel, err := model.GetChannelById(1, false)
+		return err == nil && channel.Status == common.ChannelStatusAutoDisabled
+	}, 2*time.Second, 20*time.Millisecond)
+	channel, err := model.GetChannelById(2, false)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusEnabled, channel.Status)
+}
+
+func TestBatchSubmissionKeepsAChannelWithoutAutoBanEnabled(t *testing.T) {
+	withRetries(t, 2)
+	previous := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+	resetDB(t)
+	broken, healthy := newFakeUpstream(t), newFakeUpstream(t)
+	broken.submitStatus = http.StatusUnauthorized
+	seedPrioritizedChannel(t, 1, broken.server.URL, 10, 0)
+	seedPrioritizedChannel(t, 2, healthy.server.URL, 0, 1)
+	file := upload(t, testUser, chatLine("a", "x", 10))
+	_, apiErr := create(t, file.FileId)
+	require.Nil(t, apiErr)
+	time.Sleep(200 * time.Millisecond)
+	channel, err := model.GetChannelById(1, false)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusEnabled, channel.Status)
+}
+
+func TestBatchSubmissionWithoutRetryBudgetTriesOneChannel(t *testing.T) {
+	resetDB(t)
+	first, second := newFakeUpstream(t), newFakeUpstream(t)
+	first.submitStatus = http.StatusUnauthorized
+	seedPrioritizedChannel(t, 1, first.server.URL, 10, 1)
+	seedPrioritizedChannel(t, 2, second.server.URL, 0, 1)
+	file := upload(t, testUser, chatLine("a", "x", 10))
+	_, apiErr := create(t, file.FileId)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusBadGateway, apiErr.Status)
+	assert.Zero(t, second.submits, "RetryTimes is 0, as in the synchronous relay")
+}
+
+func TestBatchSubmissionDoesNotRetryTheCallersMistake(t *testing.T) {
+	withRetries(t, 2)
+	resetDB(t)
+	first, second := newFakeUpstream(t), newFakeUpstream(t)
+	first.submitStatus = http.StatusBadRequest
+	seedPrioritizedChannel(t, 1, first.server.URL, 10, 1)
+	seedPrioritizedChannel(t, 2, second.server.URL, 0, 1)
+	file := upload(t, testUser, chatLine("a", "x", 10))
+	_, apiErr := create(t, file.FileId)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusBadRequest, apiErr.Status)
+	assert.Equal(t, 1, first.submits)
+	assert.Zero(t, second.submits, "a request the upstream calls invalid is not sent again")
+	assert.Zero(t, batchCount(t))
+}
+
+func TestBatchSubmissionWithUnknownOutcomeIsNotRetried(t *testing.T) {
+	withRetries(t, 2)
+	resetDB(t)
+	first, second := newFakeUpstream(t), newFakeUpstream(t)
+	first.submitStatus = http.StatusBadGateway
+	seedPrioritizedChannel(t, 1, first.server.URL, 10, 1)
+	seedPrioritizedChannel(t, 2, second.server.URL, 0, 1)
+	file := upload(t, testUser, chatLine("a", "x", 10))
+	_, apiErr := create(t, file.FileId)
+	require.NotNil(t, apiErr)
+	assert.Zero(t, second.submits, "the first upstream may already run the batch; a second submission could bill twice")
+	assert.EqualValues(t, 1, batchCount(t), "the held record keeps the reservation")
+}
+
+func TestBatchSubmissionWhenEveryChannelKeyIsRejected(t *testing.T) {
+	withRetries(t, 2)
+	resetDB(t)
+	first, second := newFakeUpstream(t), newFakeUpstream(t)
+	first.submitStatus, second.submitStatus = http.StatusUnauthorized, http.StatusForbidden
+	seedPrioritizedChannel(t, 1, first.server.URL, 10, 0)
+	seedPrioritizedChannel(t, 2, second.server.URL, 0, 0)
+	file := upload(t, testUser, chatLine("a", "x", 10))
+	_, apiErr := create(t, file.FileId)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusBadGateway, apiErr.Status, "a channel credential problem is a gateway error, not the caller's 401 or 403")
+	assert.NotContains(t, apiErr.Error(), "rejected the batch")
+	assert.GreaterOrEqual(t, first.submits+second.submits, 2)
+	assert.Zero(t, batchCount(t))
+	require.Eventually(t, func() bool { return userQuota(t, testUser) == startQuota }, 2*time.Second, 20*time.Millisecond)
+	assert.Equal(t, startQuota, tokenRemain(t, testToken))
+}
+
+func TestBatchPollHoldsWhenTheUpstreamSaysTheKeyIsInvalid(t *testing.T) {
+	resetDB(t)
+	upstream := newFakeUpstream(t)
+	seedBatchChannel(t, 1, constant.ChannelTypeOpenRouter, upstream.server.URL)
+	file := upload(t, testUser, chatLine("a", "x", 10))
+	b, apiErr := create(t, file.FileId)
+	require.Nil(t, apiErr)
+	upstream.mu.Lock()
+	upstream.retrieveCode = http.StatusBadRequest
+	upstream.retrieveBody = `{"error":{"code":400,"message":"API key expired. Please renew the API key."}}`
+	upstream.mu.Unlock()
+	var held *model.Batch
+	for attempt := 0; attempt < 10; attempt++ {
+		held = poll(t, b.BatchId)
+		if held.BillingState == model.BatchBillingHeld {
+			break
+		}
+	}
+	require.Equal(t, model.BatchBillingHeld, held.BillingState, "an expired key is held for an administrator, not retried for days")
+	assert.Contains(t, held.Errors, "channel_unauthorized")
 }
 
 func TestBatchWithoutNativeChannelFails(t *testing.T) {

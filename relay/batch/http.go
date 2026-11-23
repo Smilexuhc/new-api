@@ -58,7 +58,7 @@ func doUpstream(ctx context.Context, conn *Connection, method string, url string
 		return nil, fmt.Errorf("%w: upstream response exceeds %d bytes", errResponseLost, maxUpstreamResponseBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &UpstreamError{StatusCode: resp.StatusCode, Message: cleanMessage(upstreamErrorMessage(data), conn.BaseURL)}
+		return nil, &UpstreamError{StatusCode: resp.StatusCode, Message: cleanMessage(upstreamErrorMessage(data), conn.BaseURL), KeyRejected: upstreamKeyRejected(resp.StatusCode, data)}
 	}
 	return data, nil
 }
@@ -96,6 +96,20 @@ func upstreamErrorMessage(data []byte) string {
 		}
 	}
 	return string(data)
+}
+
+// upstreamKeyRejected reports whether an error answer says the key is bad.
+// Google answers a wrong or expired key with 400 and the reason
+// API_KEY_INVALID, not with 401.
+func upstreamKeyRejected(status int, data []byte) bool {
+	if status == http.StatusUnauthorized {
+		return true
+	}
+	if status != http.StatusBadRequest && status != http.StatusForbidden {
+		return false
+	}
+	text := strings.ToLower(string(data))
+	return strings.Contains(text, "api_key_invalid") || strings.Contains(text, "api key not valid") || strings.Contains(text, "api key expired")
 }
 
 // maskedAddressPort is a port left on an address the shared masker already
